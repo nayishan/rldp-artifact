@@ -18,8 +18,7 @@ The same commit is recorded in `base_commit.txt`.
 postgresql-rldp.patch
 ```
 
-This is a single patch generated from the `chunk-paired-umbra-poc` branch
-relative to the base commit above.
+This is a single implementation patch for the PostgreSQL-based RLDP prototype.
 
 ## Apply
 
