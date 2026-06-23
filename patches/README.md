@@ -34,13 +34,3 @@ Then inspect and commit the applied changes if desired:
 ```sh
 git status --short
 ```
-
-## Source Branch
-
-The patch was generated from:
-
-```text
-repository: git@github.com:nayishan/postgre_umbra.git
-branch: chunk-paired-umbra-poc
-head: 34ce984aed
-```
