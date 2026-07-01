@@ -1,0 +1,3 @@
+case,step,result,details_csv,notes
+C2,chunk,PASS,/home/jiamingwei/exp2/results/exp2_torn_page_summary.csv,target=16;remap=16;updated=16;damaged=16;hash_changed=16;post_checked=16;post_not_damaged=16;recovery_ok=yes;total_rows=20000;bad_updated=0;bad_untouched=0;table_equal=yes
+C3,checkpoint_publication,PASS,/home/jiamingwei/exp2/results/exp2_c3_checkpoint_publication.csv,pause_entered=yes;checkpoint_waited=yes;checkpoint_blocked=yes;update_completed=yes;checkpoint_completed=yes;recovery_ok=yes;signature_equal=yes;updated_rows=5

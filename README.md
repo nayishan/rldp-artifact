@@ -4,7 +4,7 @@ This repository contains supplemental material for the PVLDB submission
 "Recovery-Lifetime Data Pages for Reducing Full-Page WAL".
 
 The artifact includes prototype patches, experiment scripts, configuration
-files, result-processing utilities, and selected raw/processed outputs used for
+files, result-processing utilities, and selected stored summaries used for
 the paper evaluation.
 
 ## Contents
@@ -13,10 +13,15 @@ the paper evaluation.
 - `scripts/`: experiment runners for checkpoint first-dirty WAL attribution,
   crash recovery, TPC-C, capacity, and locality measurements.
 - `configs/`: database, benchmark, and machine configuration notes.
-- `results/`: raw and processed experiment outputs.
+- `results/`: stored experiment summaries used by the paper.
 - `analysis/`: scripts for parsing logs and producing summary tables.
 - `figures/`: generated figures and table inputs.
 - `docs/`: build and reproduction instructions.
+
+## Build
+
+To build the patched PostgreSQL prototype from the baseline commit, see
+`docs/BUILD.md`.
 
 ## Status
 

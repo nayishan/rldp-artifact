@@ -1,3 +1,3 @@
 # Results
 
-Store raw logs and processed result summaries by experiment.
+Stored experiment summaries used by the paper are grouped by experiment under `processed/`.

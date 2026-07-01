@@ -846,7 +846,7 @@ index 0000000000..f05b4fb127
 +	}
 +}
 diff --git a/src/backend/access/transam/xlog.c b/src/backend/access/transam/xlog.c
-index d69d03b2ef..b01e7921f0 100644
+index d69d03b2ef..862fb01ba0 100644
 --- a/src/backend/access/transam/xlog.c
 +++ b/src/backend/access/transam/xlog.c
 @@ -98,6 +98,9 @@
@@ -859,26 +859,59 @@ index d69d03b2ef..b01e7921f0 100644
  #include "utils/guc_hooks.h"
  #include "utils/guc_tables.h"
  #include "utils/injection_point.h"
-@@ -8061,6 +8064,9 @@ CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
+@@ -7605,6 +7608,10 @@ CreateCheckPoint(int flags)
+ 	XLogCtl->RedoRecPtr = checkPoint.redo;
+ 	SpinLockRelease(&XLogCtl->info_lck);
+ 
++#ifdef USE_UMBRA
++	CheckPointBuffersCaptureBegin();
++#endif
++
+ 	/*
+ 	 * If enabled, log checkpoint start.  We postpone this until now so as not
+ 	 * to log anything if we decided to skip the checkpoint.
+@@ -8061,6 +8068,10 @@ CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
  	CheckPointSUBTRANS();
  	CheckPointMultiXact();
  	CheckPointPredicate();
 +#ifdef USE_UMBRA
++	CheckPointBuffersPrepare(flags);
 +	MapCheckpoint();
 +#endif
  	CheckPointBuffers(flags);
  
  	/* Perform all queued up fsyncs */
+@@ -8209,6 +8220,10 @@ CreateRestartPoint(int flags)
+ 	XLogCtl->RedoRecPtr = lastCheckPoint.redo;
+ 	SpinLockRelease(&XLogCtl->info_lck);
+ 
++#ifdef USE_UMBRA
++	CheckPointBuffersCaptureBegin();
++#endif
++
+ 	/*
+ 	 * Prepare to accumulate statistics.
+ 	 *
 diff --git a/src/backend/access/transam/xloginsert.c b/src/backend/access/transam/xloginsert.c
-index f2e10b82b7..a3a4efa517 100644
+index f2e10b82b7..58740cc8d2 100644
 --- a/src/backend/access/transam/xloginsert.c
 +++ b/src/backend/access/transam/xloginsert.c
-@@ -39,6 +39,12 @@
+@@ -19,6 +19,8 @@
+ 
+ #include "postgres.h"
+ 
++#include <sys/stat.h>
++
+ #ifdef USE_LZ4
+ #include <lz4.h>
+ #endif
+@@ -39,6 +41,13 @@
  #include "replication/origin.h"
  #include "storage/bufmgr.h"
  #include "storage/proc.h"
 +#include "storage/smgr.h"
 +#ifdef USE_UMBRA
++#include "storage/fd.h"
 +#include "storage/map.h"
 +#include "storage/umbra.h"
 +#include "storage/umfile.h"
@@ -886,11 +919,12 @@ index f2e10b82b7..a3a4efa517 100644
  #include "utils/memutils.h"
  #include "utils/pgstat_internal.h"
  #include "utils/rel.h"
-@@ -85,6 +91,16 @@ typedef struct
+@@ -85,6 +94,17 @@ typedef struct
  	XLogRecData bkp_rdatas[2];	/* temporary rdatas used to hold references to
  								 * backup block data in XLogRecordAssemble() */
  
 +#ifdef USE_UMBRA
++	Buffer		buffer;			/* shared buffer, if registered from one */
 +	bool		has_shift;		/* true if shift metadata is prepared */
 +	bool		shift_in_record;	/* current record includes shift */
 +	bool		shift_committed;	/* shift slot was committed after insert */
@@ -903,7 +937,7 @@ index f2e10b82b7..a3a4efa517 100644
  	/* buffer to store a compressed version of backup block image */
  	char		compressed_page[COMPRESS_BUFSIZE];
  } registered_buffer;
-@@ -133,18 +149,129 @@ static int	num_rdatas;			/* entries currently used */
+@@ -133,18 +153,200 @@ static int	num_rdatas;			/* entries currently used */
  static int	max_rdatas;			/* allocated size */
  
  static bool begininsert_called = false;
@@ -930,6 +964,7 @@ index f2e10b82b7..a3a4efa517 100644
 +											XLogRecPtr *fpw_lsn, int *num_fpi,
 +											uint64 *fpi_bytes,
 +											bool *topxid_included);
++static void XLogExp2C3PauseAfterInsertUmbra(XLogRecPtr record_endptr);
 +static void XLogCommitBlockShiftsUmbra(XLogRecPtr record_endptr);
 +static void XLogAbortBlockShiftsUmbra(void);
 +static void XLogFillBlockShiftFrontierUmbra(registered_buffer *regbuf,
@@ -962,6 +997,75 @@ index f2e10b82b7..a3a4efa517 100644
 +};
 +
 +#ifdef USE_UMBRA
++#define UMBRA_EXP2_C3_PAUSE_ENTERED_FILE	"umbra_exp2_c3_pause_entered"
++#define UMBRA_EXP2_C3_RELEASE_FILE		"umbra_exp2_c3_release"
++
++static void
++XLogExp2C3PauseAfterInsertUmbra(XLogRecPtr record_endptr)
++{
++	char		entered_path[MAXPGPATH];
++	char		release_path[MAXPGPATH];
++	char		lsnbuf[64];
++	int			fd;
++	int			len;
++	struct stat st;
++
++	if (!umbra_exp2_c3_pause)
++		return;
++
++	snprintf(entered_path, MAXPGPATH, "%s/%s", DataDir,
++			 UMBRA_EXP2_C3_PAUSE_ENTERED_FILE);
++	snprintf(release_path, MAXPGPATH, "%s/%s", DataDir,
++			 UMBRA_EXP2_C3_RELEASE_FILE);
++
++	fd = BasicOpenFile(entered_path,
++					   O_CREAT | O_TRUNC | O_WRONLY | PG_BINARY);
++	if (fd < 0)
++	{
++		elog(LOG, "could not create Umbra Exp2 C3 pause marker file \"%s\": %m",
++			 entered_path);
++		return;
++	}
++
++	len = snprintf(lsnbuf, sizeof(lsnbuf), "%X/%08X\n",
++				   LSN_FORMAT_ARGS(record_endptr));
++	if (write(fd, lsnbuf, len) != len)
++	{
++		int			save_errno = errno;
++
++		close(fd);
++		errno = save_errno;
++		elog(LOG, "could not write Umbra Exp2 C3 pause marker file \"%s\": %m",
++			 entered_path);
++		return;
++	}
++
++	if (close(fd) != 0)
++	{
++		elog(LOG, "could not close Umbra Exp2 C3 pause marker file \"%s\": %m",
++			 entered_path);
++		return;
++	}
++
++	elog(LOG, "Umbra Exp2 C3 pause after WAL insert at %X/%08X",
++		 LSN_FORMAT_ARGS(record_endptr));
++
++	while (stat(release_path, &st) != 0)
++	{
++		if (errno != ENOENT)
++		{
++			elog(LOG, "could not stat Umbra Exp2 C3 release marker file \"%s\": %m",
++				 release_path);
++			break;
++		}
++
++		pg_usleep(10000L);
++	}
++
++	elog(LOG, "Umbra Exp2 C3 pause released at %X/%08X",
++		 LSN_FORMAT_ARGS(record_endptr));
++}
++
 +static void
 +XLogFillBlockShiftFrontierUmbra(registered_buffer *regbuf,
 +								XLogRecordBlockShiftHeader *rbsh)
@@ -992,6 +1096,7 @@ index f2e10b82b7..a3a4efa517 100644
 +
 +		ctx = umfile_ctx_acquire(regbuf->shift_reln->smgr_rlocator);
 +
++		BufferSaveCheckpointSlot(regbuf->buffer, regbuf->shift_source_slot);
 +		UmShiftSetActiveSlot(regbuf->shift_reln, regbuf->forkno, regbuf->block,
 +							  regbuf->shift_target_slot, record_endptr);
 +		if (UmbraChunkPairedPhysicalCapacity(regbuf->shift_logical_nblocks,
@@ -1038,7 +1143,7 @@ index f2e10b82b7..a3a4efa517 100644
  /*
   * Begin constructing a WAL record. This must be called before the
   * XLogRegister* functions and XLogInsert().
-@@ -227,14 +354,30 @@ XLogResetInsertion(void)
+@@ -227,14 +429,31 @@ XLogResetInsertion(void)
  {
  	int			i;
  
@@ -1050,6 +1155,7 @@ index f2e10b82b7..a3a4efa517 100644
 +	{
  		registered_buffers[i].in_use = false;
 +#ifdef USE_UMBRA
++		registered_buffers[i].buffer = InvalidBuffer;
 +		registered_buffers[i].has_shift = false;
 +		registered_buffers[i].shift_in_record = false;
 +		registered_buffers[i].shift_committed = false;
@@ -1069,11 +1175,12 @@ index f2e10b82b7..a3a4efa517 100644
  	begininsert_called = false;
  }
  
-@@ -283,6 +426,15 @@ XLogRegisterBuffer(uint8 block_id, Buffer buffer, uint8 flags)
+@@ -283,6 +502,16 @@ XLogRegisterBuffer(uint8 block_id, Buffer buffer, uint8 flags)
  	regbuf->flags = flags;
  	regbuf->rdata_tail = (XLogRecData *) &regbuf->rdata_head;
  	regbuf->rdata_len = 0;
 +#ifdef USE_UMBRA
++	regbuf->buffer = buffer;
 +	regbuf->has_shift = false;
 +	regbuf->shift_in_record = false;
 +	regbuf->shift_committed = false;
@@ -1085,11 +1192,12 @@ index f2e10b82b7..a3a4efa517 100644
  
  	/*
  	 * Check that this page hasn't already been registered with some other
-@@ -336,6 +488,15 @@ XLogRegisterBlock(uint8 block_id, RelFileLocator *rlocator, ForkNumber forknum,
+@@ -336,6 +565,16 @@ XLogRegisterBlock(uint8 block_id, RelFileLocator *rlocator, ForkNumber forknum,
  	regbuf->flags = flags;
  	regbuf->rdata_tail = (XLogRecData *) &regbuf->rdata_head;
  	regbuf->rdata_len = 0;
 +#ifdef USE_UMBRA
++	regbuf->buffer = InvalidBuffer;
 +	regbuf->has_shift = false;
 +	regbuf->shift_in_record = false;
 +	regbuf->shift_committed = false;
@@ -1101,7 +1209,7 @@ index f2e10b82b7..a3a4efa517 100644
  
  	/*
  	 * Check that this page hasn't already been registered with some other
-@@ -509,30 +670,64 @@ XLogInsert(RmgrId rmid, uint8 info)
+@@ -509,30 +748,69 @@ XLogInsert(RmgrId rmid, uint8 info)
  		return EndPos;
  	}
  
@@ -1150,10 +1258,16 @@ index f2e10b82b7..a3a4efa517 100644
 +					delay_chkp_start_set = true;
 +				}
 +			}
-+
+ 
+-		rdt = XLogRecordAssemble(rmid, info, RedoRecPtr, doPageWrites,
+-								 &fpw_lsn, &num_fpi, &fpi_bytes,
+-								 &topxid_included);
 +			EndPos = XLogInsertRecord(rdt, fpw_lsn, curinsert_flags, num_fpi,
 +									  fpi_bytes, topxid_included);
-+
+ 
+-		EndPos = XLogInsertRecord(rdt, fpw_lsn, curinsert_flags, num_fpi,
+-								  fpi_bytes, topxid_included);
+-	} while (!XLogRecPtrIsValid(EndPos));
 +			if (!XLogRecPtrIsValid(EndPos) && curinsert_has_block_shift)
 +			{
 +				if (delay_chkp_start_set)
@@ -1161,15 +1275,14 @@ index f2e10b82b7..a3a4efa517 100644
 +				END_CRIT_SECTION();
 +			}
 +		} while (!XLogRecPtrIsValid(EndPos));
- 
--		rdt = XLogRecordAssemble(rmid, info, RedoRecPtr, doPageWrites,
--								 &fpw_lsn, &num_fpi, &fpi_bytes,
--								 &topxid_included);
++
++#ifdef USE_UMBRA
++		if (curinsert_has_block_shift)
++			XLogExp2C3PauseAfterInsertUmbra(EndPos);
++#endif
++
 +		xlog_storage_mgr_f.xlog_insert_finish(EndPos);
- 
--		EndPos = XLogInsertRecord(rdt, fpw_lsn, curinsert_flags, num_fpi,
--								  fpi_bytes, topxid_included);
--	} while (!XLogRecPtrIsValid(EndPos));
++
 +		if (curinsert_has_block_shift)
 +		{
 +			if (delay_chkp_start_set)
@@ -1186,7 +1299,7 @@ index f2e10b82b7..a3a4efa517 100644
  
  	XLogResetInsertion();
  
-@@ -617,11 +812,12 @@ XLogGetFakeLSN(Relation rel)
+@@ -617,11 +895,12 @@ XLogGetFakeLSN(Relation rel)
   * *topxid_included is set if the topmost transaction ID is logged with the
   * current subtransaction.
   */
@@ -1203,7 +1316,7 @@ index f2e10b82b7..a3a4efa517 100644
  {
  	XLogRecData *rdt;
  	uint64		total_len = 0;
-@@ -1009,6 +1205,374 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
+@@ -1009,6 +1288,376 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
  
  	return &hdr_rdt;
  }
@@ -1299,6 +1412,8 @@ index f2e10b82b7..a3a4efa517 100644
 +			regbuf->shift_target_slot =
 +				UmShiftChooseTargetSlot(reln, regbuf->forkno, regbuf->block,
 +										&regbuf->shift_source_slot);
++			BufferSaveCheckpointSlot(regbuf->buffer,
++									  regbuf->shift_source_slot);
 +
 +			regbuf->has_shift = true;
 +			regbuf->shift_committed = false;
@@ -1652,7 +1767,7 @@ index 3145c58a9b..5d27526360 100644
  			{
  				COPY_HEADER_FIELD(&blk->bimg_len, sizeof(uint16));
 diff --git a/src/backend/access/transam/xlogutils.c b/src/backend/access/transam/xlogutils.c
-index 5fbe39133b..89151ba779 100644
+index 5fbe39133b..415da04339 100644
 --- a/src/backend/access/transam/xlogutils.c
 +++ b/src/backend/access/transam/xlogutils.c
 @@ -25,6 +25,10 @@
@@ -1666,7 +1781,7 @@ index 5fbe39133b..89151ba779 100644
  #include "storage/smgr.h"
  #include "utils/hsearch.h"
  #include "utils/rel.h"
-@@ -77,10 +81,46 @@ typedef struct xl_invalid_page
+@@ -77,10 +81,49 @@ typedef struct xl_invalid_page
  
  static HTAB *invalid_page_tab = NULL;
  
@@ -1708,12 +1823,15 @@ index 5fbe39133b..89151ba779 100644
 +												ForkNumber forknum,
 +												BlockNumber blkno,
 +												XLogRecPtr lsn);
++static bool XLogUmbraPhysicalPageExistsForRedo(RelFileLocator rlocator,
++											   ForkNumber forknum,
++											   BlockNumber blkno);
 +#endif
 +
  /* Report a reference to an invalid page */
  static void
  report_invalid_page(int elevel, RelFileLocator locator, ForkNumber forkno,
-@@ -96,6 +136,16 @@ report_invalid_page(int elevel, RelFileLocator locator, ForkNumber forkno,
+@@ -96,6 +139,16 @@ report_invalid_page(int elevel, RelFileLocator locator, ForkNumber forkno,
  			 blkno, path.str);
  }
  
@@ -1730,7 +1848,7 @@ index 5fbe39133b..89151ba779 100644
  /* Log a reference to an invalid page */
  static void
  log_invalid_page(RelFileLocator locator, ForkNumber forkno, BlockNumber blkno,
-@@ -160,6 +210,39 @@ log_invalid_page(RelFileLocator locator, ForkNumber forkno, BlockNumber blkno,
+@@ -160,6 +213,39 @@ log_invalid_page(RelFileLocator locator, ForkNumber forkno, BlockNumber blkno,
  	}
  }
  
@@ -1770,7 +1888,7 @@ index 5fbe39133b..89151ba779 100644
  /* Forget any invalid pages >= minblkno, because they've been dropped */
  static void
  forget_invalid_pages(RelFileLocator locator, ForkNumber forkno,
-@@ -219,6 +302,48 @@ forget_invalid_pages_db(Oid dbid)
+@@ -219,6 +305,48 @@ forget_invalid_pages_db(Oid dbid)
  	}
  }
  
@@ -1819,7 +1937,7 @@ index 5fbe39133b..89151ba779 100644
  /* Are there any unresolved references to invalid pages? */
  bool
  XLogHaveInvalidPages(void)
-@@ -226,6 +351,11 @@ XLogHaveInvalidPages(void)
+@@ -226,6 +354,11 @@ XLogHaveInvalidPages(void)
  	if (invalid_page_tab != NULL &&
  		hash_get_num_entries(invalid_page_tab) > 0)
  		return true;
@@ -1831,7 +1949,7 @@ index 5fbe39133b..89151ba779 100644
  	return false;
  }
  
-@@ -237,21 +367,43 @@ XLogCheckInvalidPages(void)
+@@ -237,21 +370,43 @@ XLogCheckInvalidPages(void)
  	xl_invalid_page *hentry;
  	bool		foundone = false;
  
@@ -1884,7 +2002,7 @@ index 5fbe39133b..89151ba779 100644
  
  	if (foundone)
  		elog(ignore_invalid_pages ? WARNING : PANIC,
-@@ -259,8 +411,113 @@ XLogCheckInvalidPages(void)
+@@ -259,8 +414,129 @@ XLogCheckInvalidPages(void)
  
  	hash_destroy(invalid_page_tab);
  	invalid_page_tab = NULL;
@@ -1991,6 +2109,22 @@ index 5fbe39133b..89151ba779 100644
 +								logical_nblocks, lsn);
 +	smgrbumpcachednblocks(smgr, forknum, logical_nblocks);
 +	return true;
++}
++
++static bool
++XLogUmbraPhysicalPageExistsForRedo(RelFileLocator rlocator, ForkNumber forknum,
++								   BlockNumber blkno)
++{
++	SMgrRelation smgr;
++
++	if (forknum == INIT_FORKNUM || smgrisinternalfork(forknum))
++		return true;
++
++	smgr = smgropen(rlocator, INVALID_PROC_NUMBER);
++	if (!UmUsesChunkPairedTranslation(smgr, forknum))
++		return true;
++
++	return UmTranslationPhysicalBlockExists(smgr, forknum, blkno);
  }
  
 +#endif
@@ -1998,7 +2132,7 @@ index 5fbe39133b..89151ba779 100644
  
  /*
   * XLogReadBufferForRedo
-@@ -341,6 +598,22 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
+@@ -341,6 +617,22 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
  							  uint8 block_id,
  							  ReadBufferMode mode, bool get_cleanup_lock,
  							  Buffer *buf)
@@ -2021,7 +2155,7 @@ index 5fbe39133b..89151ba779 100644
  {
  	XLogRecPtr	lsn = record->EndRecPtr;
  	RelFileLocator rlocator;
-@@ -354,15 +627,10 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
+@@ -354,15 +646,10 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
  	if (!XLogRecGetBlockTagExtended(record, block_id, &rlocator, &forknum, &blkno,
  									&prefetch_buffer))
  	{
@@ -2037,7 +2171,7 @@ index 5fbe39133b..89151ba779 100644
  	zeromode = (mode == RBM_ZERO_AND_LOCK || mode == RBM_ZERO_AND_CLEANUP_LOCK);
  	willinit = (XLogRecGetBlock(record, block_id)->flags & BKPBLOCK_WILL_INIT) != 0;
  	if (willinit && !zeromode)
-@@ -370,7 +638,6 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
+@@ -370,7 +657,6 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
  	if (!willinit && zeromode)
  		elog(PANIC, "block to be initialized in redo routine must be marked with WILL_INIT flag in the WAL record");
  
@@ -2045,7 +2179,7 @@ index 5fbe39133b..89151ba779 100644
  	if (XLogRecBlockImageApply(record, block_id))
  	{
  		Assert(XLogRecHasBlockImage(record, block_id));
-@@ -383,49 +650,187 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
+@@ -383,49 +669,194 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
  					(errcode(ERRCODE_INTERNAL_ERROR),
  					 errmsg_internal("%s", record->errormsg_buf)));
  
@@ -2154,6 +2288,13 @@ index 5fbe39133b..89151ba779 100644
 +		BlockNumber physical_nblocks;
 +
 +		smgrcreate(smgr, forknum, true);
++		if (!has_image && !zeromode && mode == RBM_NORMAL &&
++			!UmTranslationSlotPhysicalBlockExists(smgr, forknum, blkno,
++												  blk->source_slot))
++		{
++			log_invalid_page(rlocator, forknum, blkno, false);
+ 			return BLK_NOTFOUND;
++		}
 +		if (!UmbraChunkPairedPhysicalCapacity(blk->logical_nblocks,
 +											 &physical_nblocks))
 +			elog(PANIC,
@@ -2164,7 +2305,7 @@ index 5fbe39133b..89151ba779 100644
 +			!MapSBlockEnsurePhysicalNblocks(ctx, rlocator, forknum,
 +											physical_nblocks,
 +											true /* skipFsync */))
- 			return BLK_NOTFOUND;
++			return BLK_NOTFOUND;
 +		MapSBlockBumpLogicalNblocks(ctx, rlocator, forknum,
 +									blk->logical_nblocks, lsn);
 +		smgrbumpcachednblocks(smgr, forknum, blk->logical_nblocks);
@@ -2257,7 +2398,24 @@ index 5fbe39133b..89151ba779 100644
  
  /*
   * XLogReadBufferExtended
-@@ -630,6 +1035,9 @@ void
+@@ -493,6 +924,16 @@ XLogReadBufferExtended(RelFileLocator rlocator, ForkNumber forknum,
+ 
+ 	if (blkno < lastblock)
+ 	{
++#ifdef USE_UMBRA
++		if ((mode == RBM_NORMAL || mode == RBM_NORMAL_NO_LOG) &&
++			!XLogUmbraPhysicalPageExistsForRedo(rlocator, forknum, blkno))
++		{
++			if (mode == RBM_NORMAL)
++				log_invalid_page(rlocator, forknum, blkno, false);
++			return InvalidBuffer;
++		}
++#endif
++
+ 		/* page exists in file */
+ 		buffer = ReadBufferWithoutRelcache(rlocator, forknum, blkno,
+ 										   mode, NULL, true);
+@@ -630,6 +1071,9 @@ void
  XLogDropRelation(RelFileLocator rlocator, ForkNumber forknum)
  {
  	forget_invalid_pages(rlocator, forknum, 0);
@@ -2267,7 +2425,7 @@ index 5fbe39133b..89151ba779 100644
  }
  
  /*
-@@ -649,6 +1057,9 @@ XLogDropDatabase(Oid dbid)
+@@ -649,6 +1093,9 @@ XLogDropDatabase(Oid dbid)
  	smgrdestroyall();
  
  	forget_invalid_pages_db(dbid);
@@ -3165,11 +3323,640 @@ index 2afb42ca96..b07ba46dbb 100644
 +endif
 +
  include $(top_srcdir)/src/backend/common.mk
+diff --git a/src/backend/storage/buffer/buf_init.c b/src/backend/storage/buffer/buf_init.c
+index 1407c930c5..7cf6d9285c 100644
+--- a/src/backend/storage/buffer/buf_init.c
++++ b/src/backend/storage/buffer/buf_init.c
+@@ -26,6 +26,11 @@ char	   *BufferBlocks;
+ ConditionVariableMinimallyPadded *BufferIOCVArray;
+ WritebackContext BackendWritebackContext;
+ CkptSortItem *CkptBufferIds;
++#ifdef USE_UMBRA
++uint8	   *CkptBufferSlots;
++uint32	   *CkptBufferSlotEpochs;
++pg_atomic_uint32 *CkptBufferSlotCaptureEpoch;
++#endif
+ 
+ static void BufferManagerShmemRequest(void *arg);
+ static void BufferManagerShmemInit(void *arg);
+@@ -108,6 +113,21 @@ BufferManagerShmemRequest(void *arg)
+ 					   .size = NBuffers * sizeof(CkptSortItem),
+ 					   .ptr = (void **) &CkptBufferIds,
+ 		);
++
++#ifdef USE_UMBRA
++	ShmemRequestStruct(.name = "Checkpoint Buffer Slots",
++					   .size = NBuffers * sizeof(uint8),
++					   .ptr = (void **) &CkptBufferSlots,
++		);
++	ShmemRequestStruct(.name = "Checkpoint Buffer Slot Epochs",
++					   .size = NBuffers * sizeof(uint32),
++					   .ptr = (void **) &CkptBufferSlotEpochs,
++		);
++	ShmemRequestStruct(.name = "Checkpoint Buffer Slot Capture Epoch",
++					   .size = sizeof(pg_atomic_uint32),
++					   .ptr = (void **) &CkptBufferSlotCaptureEpoch,
++		);
++#endif
+ }
+ 
+ /*
+@@ -119,6 +139,10 @@ BufferManagerShmemRequest(void *arg)
+ static void
+ BufferManagerShmemInit(void *arg)
+ {
++#ifdef USE_UMBRA
++	pg_atomic_init_u32(CkptBufferSlotCaptureEpoch, 0);
++#endif
++
+ 	/*
+ 	 * Initialize all the buffer headers.
+ 	 */
+@@ -137,6 +161,10 @@ BufferManagerShmemInit(void *arg)
+ 
+ 		proclist_init(&buf->lock_waiters);
+ 		ConditionVariableInit(BufferDescriptorGetIOCV(buf));
++#ifdef USE_UMBRA
++		CkptBufferSlots[i] = CKPT_BUFFER_SLOT_INVALID;
++		CkptBufferSlotEpochs[i] = 0;
++#endif
+ 	}
+ 
+ 	/* Initialize per-backend file flush context */
 diff --git a/src/backend/storage/buffer/bufmgr.c b/src/backend/storage/buffer/bufmgr.c
-index cc398db124..d3c173d3fd 100644
+index cc398db124..2347545912 100644
 --- a/src/backend/storage/buffer/bufmgr.c
 +++ b/src/backend/storage/buffer/bufmgr.c
-@@ -5500,7 +5500,8 @@ CreateAndCopyRelationData(RelFileLocator src_rlocator,
+@@ -64,6 +64,9 @@
+ #include "storage/read_stream.h"
+ #include "storage/smgr.h"
+ #include "storage/standby.h"
++#ifdef USE_UMBRA
++#include "storage/umbra.h"
++#endif
+ #include "utils/memdebug.h"
+ #include "utils/ps_status.h"
+ #include "utils/rel.h"
+@@ -633,6 +636,7 @@ static bool PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy,
+ static void PinBuffer_Locked(BufferDesc *buf);
+ static void UnpinBuffer(BufferDesc *buf);
+ static void UnpinBufferNoOwner(BufferDesc *buf);
++static int	BufferSyncPrepare(int flags);
+ static void BufferSync(int flags);
+ static int	SyncOneBuffer(int buf_id, bool skip_recently_used,
+ 						  WritebackContext *wb_context);
+@@ -654,10 +658,29 @@ static pg_attribute_always_inline void TrackBufferHit(IOObject io_object,
+ 													  Relation rel, char persistence, SMgrRelation smgr,
+ 													  ForkNumber forknum, BlockNumber blocknum);
+ static Buffer GetVictimBuffer(BufferAccessStrategy strategy, IOContext io_context);
+-static void FlushUnlockedBuffer(BufferDesc *buf, SMgrRelation reln,
+-								IOObject io_object, IOContext io_context);
+-static void FlushBuffer(BufferDesc *buf, SMgrRelation reln,
+-						IOObject io_object, IOContext io_context);
++static bool FlushUnlockedBuffer(BufferDesc *buf, SMgrRelation reln,
++								IOObject io_object, IOContext io_context,
++								uint8 *checkpoint_slot);
++static bool FlushBuffer(BufferDesc *buf, SMgrRelation reln,
++						IOObject io_object, IOContext io_context,
++						uint8 *checkpoint_slot);
++#ifdef USE_UMBRA
++static bool CkptBufferIdsPrepared = false;
++static int	CkptBufferIdsPreparedCount = 0;
++#define CKPT_BUFFER_SLOT_EPOCH_ACTIVE	((uint32) 0x80000000)
++#define CKPT_BUFFER_SLOT_EPOCH_MASK		((uint32) 0x7FFFFFFF)
++static uint32 CkptBufferSlotActiveEpoch(void);
++static void ClearCheckpointBufferSlot(BufferDesc *buf);
++static void TerminateCheckpointBufferIO(BufferDesc *buf, bool forget_owner,
++										bool release_aio);
++#endif
++static void ScheduleBufferTagForWritebackWithSlot(WritebackContext *wb_context,
++												  IOContext io_context,
++												  BufferTag *tag,
++												  bool checkpoint_slot_valid,
++												  uint8 checkpoint_slot);
++static inline int pending_writeback_comparator(const PendingWriteback *a,
++											   const PendingWriteback *b);
+ static void FindAndDropRelationBuffers(RelFileLocator rlocator,
+ 									   ForkNumber forkNum,
+ 									   BlockNumber nForkBlock,
+@@ -2325,6 +2348,9 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
+ 	Assert(BUF_STATE_GET_REFCOUNT(victim_buf_state) == 1);
+ 	Assert(!(victim_buf_state & (BM_TAG_VALID | BM_VALID | BM_DIRTY | BM_IO_IN_PROGRESS)));
+ 
++#ifdef USE_UMBRA
++	ClearCheckpointBufferSlot(victim_buf_hdr);
++#endif
+ 	victim_buf_hdr->tag = newTag;
+ 
+ 	/*
+@@ -2439,6 +2465,9 @@ retry:
+ 	 * linear scans of the buffer array don't think the buffer is valid.
+ 	 */
+ 	oldFlags = buf_state & BUF_FLAG_MASK;
++#ifdef USE_UMBRA
++	ClearCheckpointBufferSlot(buf);
++#endif
+ 	ClearBufferTag(&buf->tag);
+ 
+ 	UnlockBufHdrExt(buf, buf_state,
+@@ -2523,6 +2552,9 @@ InvalidateVictimBuffer(BufferDesc *buf_hdr)
+ 	 * cheaper pre-check for several linear scans of shared buffers use the
+ 	 * tag (see e.g. FlushDatabaseBuffers()).
+ 	 */
++#ifdef USE_UMBRA
++	ClearCheckpointBufferSlot(buf_hdr);
++#endif
+ 	ClearBufferTag(&buf_hdr->tag);
+ 	UnlockBufHdrExt(buf_hdr, buf_state,
+ 					0,
+@@ -2631,11 +2663,19 @@ again:
+ 		}
+ 
+ 		/* OK, do the I/O */
+-		FlushBuffer(buf_hdr, NULL, IOOBJECT_RELATION, io_context);
++		{
++			uint8		checkpoint_slot = CKPT_BUFFER_SLOT_INVALID;
++
++			(void) FlushBuffer(buf_hdr, NULL, IOOBJECT_RELATION, io_context,
++							   &checkpoint_slot);
++			ScheduleBufferTagForWritebackWithSlot(&BackendWritebackContext,
++												  io_context,
++												  &buf_hdr->tag,
++												  checkpoint_slot !=
++												  CKPT_BUFFER_SLOT_INVALID,
++												  checkpoint_slot);
++		}
+ 		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+-
+-		ScheduleBufferTagForWriteback(&BackendWritebackContext, io_context,
+-									  &buf_hdr->tag);
+ 	}
+ 
+ 
+@@ -2986,6 +3026,9 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
+ 			Assert(!(buf_state & (BM_VALID | BM_TAG_VALID | BM_DIRTY)));
+ 			Assert(BUF_STATE_GET_REFCOUNT(buf_state) == 1);
+ 
++#ifdef USE_UMBRA
++			ClearCheckpointBufferSlot(victim_buf_hdr);
++#endif
+ 			victim_buf_hdr->tag = tag;
+ 
+ 			set_bits |= BM_TAG_VALID | BUF_USAGECOUNT_ONE;
+@@ -3557,21 +3600,13 @@ TrackNewBufferPin(Buffer buf)
+  * even unlogged buffers, which are otherwise skipped.  The remaining flags
+  * currently have no effect here.
+  */
+-static void
+-BufferSync(int flags)
++static int
++BufferSyncPrepare(int flags)
+ {
+ 	uint64		buf_state;
+ 	int			buf_id;
+ 	int			num_to_scan;
+-	int			num_spaces;
+-	int			num_processed;
+-	int			num_written;
+-	CkptTsStatus *per_ts_stat = NULL;
+-	Oid			last_tsid;
+-	binaryheap *ts_heap;
+-	int			i;
+ 	uint64		mask = BM_DIRTY;
+-	WritebackContext wb_context;
+ 
+ 	/*
+ 	 * Unless this is a shutdown checkpoint or we have been explicitly told,
+@@ -3582,6 +3617,10 @@ BufferSync(int flags)
+ 					CHECKPOINT_FLUSH_UNLOGGED))))
+ 		mask |= BM_PERMANENT;
+ 
++#ifdef USE_UMBRA
++	CheckPointBuffersCaptureBegin();
++#endif
++
+ 	/*
+ 	 * Loop over all buffers, and mark the ones that need to be written with
+ 	 * BM_CHECKPOINT_NEEDED.  Count them as we go (num_to_scan), so that we
+@@ -3602,7 +3641,8 @@ BufferSync(int flags)
+ 	for (buf_id = 0; buf_id < NBuffers; buf_id++)
+ 	{
+ 		BufferDesc *bufHdr = GetBufferDescriptor(buf_id);
+-		uint64		set_bits = 0;
++		bool		needs_checkpoint = false;
++		CkptSortItem item;
+ 
+ 		/*
+ 		 * Header spinlock is enough to examine BM_DIRTY, see comment in
+@@ -3612,29 +3652,100 @@ BufferSync(int flags)
+ 
+ 		if ((buf_state & mask) == mask)
+ 		{
+-			CkptSortItem *item;
++			item.buf_id = buf_id;
++			item.tsId = bufHdr->tag.spcOid;
++			item.dbOid = bufHdr->tag.dbOid;
++			item.relNumber = BufTagGetRelNumber(&bufHdr->tag);
++			item.forkNum = BufTagGetForkNum(&bufHdr->tag);
++			item.blockNum = bufHdr->tag.blockNum;
++			needs_checkpoint = true;
++		}
+ 
+-			set_bits = BM_CHECKPOINT_NEEDED;
++		UnlockBufHdr(bufHdr);
+ 
+-			item = &CkptBufferIds[num_to_scan++];
+-			item->buf_id = buf_id;
+-			item->tsId = bufHdr->tag.spcOid;
+-			item->relNumber = BufTagGetRelNumber(&bufHdr->tag);
+-			item->forkNum = BufTagGetForkNum(&bufHdr->tag);
+-			item->blockNum = bufHdr->tag.blockNum;
++		if (needs_checkpoint)
++		{
++			buf_state = LockBufHdr(bufHdr);
++			if ((buf_state & mask) == mask &&
++				bufHdr->tag.spcOid == item.tsId &&
++				bufHdr->tag.dbOid == item.dbOid &&
++				BufTagGetRelNumber(&bufHdr->tag) == item.relNumber &&
++				BufTagGetForkNum(&bufHdr->tag) == item.forkNum &&
++				bufHdr->tag.blockNum == item.blockNum)
++			{
++				CkptBufferIds[num_to_scan++] = item;
++				UnlockBufHdrExt(bufHdr, buf_state,
++								BM_CHECKPOINT_NEEDED, 0,
++								0);
++			}
++			else
++			{
++#ifdef USE_UMBRA
++				if (bufHdr->tag.spcOid == item.tsId &&
++					bufHdr->tag.dbOid == item.dbOid &&
++					BufTagGetRelNumber(&bufHdr->tag) == item.relNumber &&
++					BufTagGetForkNum(&bufHdr->tag) == item.forkNum &&
++					bufHdr->tag.blockNum == item.blockNum)
++					ClearCheckpointBufferSlot(bufHdr);
++#endif
++				UnlockBufHdr(bufHdr);
++			}
+ 		}
+ 
+-		UnlockBufHdrExt(bufHdr, buf_state,
+-						set_bits, 0,
+-						0);
+-
+ 		/* Check for barrier events in case NBuffers is large. */
+ 		if (ProcSignalBarrierPending)
+ 			ProcessProcSignalBarrier();
+ 	}
+ 
++	return num_to_scan;
++}
++
++/*
++ * BufferSync -- Write out all dirty buffers in the pool.
++ *
++ * This is called at checkpoint time to write out all dirty shared buffers.
++ * The checkpoint request flags should be passed in.  If CHECKPOINT_FAST is
++ * set, we disable delays between writes; if CHECKPOINT_IS_SHUTDOWN,
++ * CHECKPOINT_END_OF_RECOVERY or CHECKPOINT_FLUSH_UNLOGGED is set, we write
++ * even unlogged buffers, which are otherwise skipped.  The remaining flags
++ * currently have no effect here.
++ */
++static void
++BufferSync(int flags)
++{
++	int			buf_id;
++	int			num_to_scan;
++	int			num_spaces;
++	int			num_processed;
++	int			num_written;
++	CkptTsStatus *per_ts_stat = NULL;
++	Oid			last_tsid;
++	binaryheap *ts_heap;
++	int			i;
++	WritebackContext wb_context;
++
++#ifdef USE_UMBRA
++	if (CkptBufferIdsPrepared)
++	{
++		num_to_scan = CkptBufferIdsPreparedCount;
++		CkptBufferIdsPrepared = false;
++		CkptBufferIdsPreparedCount = 0;
++	}
++	else
++#endif
++		num_to_scan = BufferSyncPrepare(flags);
++
+ 	if (num_to_scan == 0)
++	{
++#ifdef USE_UMBRA
++		uint32		epoch_state;
++
++		epoch_state = pg_atomic_read_u32(CkptBufferSlotCaptureEpoch);
++		pg_atomic_write_u32(CkptBufferSlotCaptureEpoch,
++							 epoch_state & CKPT_BUFFER_SLOT_EPOCH_MASK);
++#endif
+ 		return;					/* nothing to do */
++	}
+ 
+ 	WritebackContextInit(&wb_context, &checkpoint_flush_after);
+ 
+@@ -3823,8 +3934,70 @@ BufferSync(int flags)
+ 	CheckpointStats.ckpt_bufs_written += num_written;
+ 
+ 	TRACE_POSTGRESQL_BUFFER_SYNC_DONE(NBuffers, num_written, num_to_scan);
++
++#ifdef USE_UMBRA
++	{
++		uint32		epoch_state;
++
++		epoch_state = pg_atomic_read_u32(CkptBufferSlotCaptureEpoch);
++		pg_atomic_write_u32(CkptBufferSlotCaptureEpoch,
++							 epoch_state & CKPT_BUFFER_SLOT_EPOCH_MASK);
++	}
++#endif
++}
++
++#ifdef USE_UMBRA
++void
++CheckPointBuffersCaptureBegin(void)
++{
++	uint32		epoch_state;
++	uint32		epoch;
++
++	epoch_state = pg_atomic_read_u32(CkptBufferSlotCaptureEpoch);
++	epoch = (epoch_state & CKPT_BUFFER_SLOT_EPOCH_MASK) + 1;
++	if (epoch == 0 || epoch > CKPT_BUFFER_SLOT_EPOCH_MASK)
++		epoch = 1;
++	pg_atomic_write_u32(CkptBufferSlotCaptureEpoch,
++						 CKPT_BUFFER_SLOT_EPOCH_ACTIVE | epoch);
+ }
+ 
++void
++CheckPointBuffersPrepare(int flags)
++{
++	CkptBufferIdsPreparedCount = BufferSyncPrepare(flags);
++	CkptBufferIdsPrepared = true;
++}
++
++void
++BufferSaveCheckpointSlot(Buffer buffer, uint8 checkpoint_slot)
++{
++	BufferDesc *bufHdr;
++	uint32		epoch;
++
++	if (!BufferIsValid(buffer) || BufferIsLocal(buffer))
++		return;
++	if (checkpoint_slot == CKPT_BUFFER_SLOT_INVALID)
++		return;
++
++	epoch = CkptBufferSlotActiveEpoch();
++	if (epoch == 0)
++		return;
++
++	bufHdr = GetBufferDescriptor(buffer - 1);
++	(void) LockBufHdr(bufHdr);
++	if (CkptBufferSlotEpochs[bufHdr->buf_id] == epoch &&
++		CkptBufferSlots[bufHdr->buf_id] != CKPT_BUFFER_SLOT_INVALID)
++	{
++		UnlockBufHdr(bufHdr);
++		return;
++	}
++
++	CkptBufferSlots[bufHdr->buf_id] = checkpoint_slot;
++	CkptBufferSlotEpochs[bufHdr->buf_id] = epoch;
++	UnlockBufHdr(bufHdr);
++}
++#endif
++
+ /*
+  * BgBufferSync -- Write out some dirty buffers in the pool.
+  *
+@@ -4141,6 +4314,8 @@ SyncOneBuffer(int buf_id, bool skip_recently_used, WritebackContext *wb_context)
+ 	int			result = 0;
+ 	uint64		buf_state;
+ 	BufferTag	tag;
++	uint8		checkpoint_slot = CKPT_BUFFER_SLOT_INVALID;
++	bool		flushed;
+ 
+ 	/* Make sure we can handle the pin */
+ 	ReservePrivateRefCountEntry();
+@@ -4182,17 +4357,24 @@ SyncOneBuffer(int buf_id, bool skip_recently_used, WritebackContext *wb_context)
+ 	 */
+ 	PinBuffer_Locked(bufHdr);
+ 
+-	FlushUnlockedBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
++	flushed = FlushUnlockedBuffer(bufHdr, NULL, IOOBJECT_RELATION,
++								  IOCONTEXT_NORMAL, &checkpoint_slot);
+ 
+ 	tag = bufHdr->tag;
+ 
+ 	UnpinBuffer(bufHdr);
+ 
++	if (!flushed)
++		return result;
++
+ 	/*
+ 	 * SyncOneBuffer() is only called by checkpointer and bgwriter, so
+ 	 * IOContext will always be IOCONTEXT_NORMAL.
+ 	 */
+-	ScheduleBufferTagForWriteback(wb_context, IOCONTEXT_NORMAL, &tag);
++	ScheduleBufferTagForWritebackWithSlot(wb_context, IOCONTEXT_NORMAL, &tag,
++										  checkpoint_slot !=
++										  CKPT_BUFFER_SLOT_INVALID,
++										  checkpoint_slot);
+ 
+ 	return result | BUF_WRITTEN;
+ }
+@@ -4508,25 +4690,56 @@ BufferGetTag(Buffer buffer, RelFileLocator *rlocator, ForkNumber *forknum,
+  * If the caller has an smgr reference for the buffer's relation, pass it
+  * as the second parameter.  If not, pass NULL.
+  */
+-static void
++static bool
+ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
+-			IOContext io_context)
++			IOContext io_context, uint8 *checkpoint_slot)
+ {
+ 	XLogRecPtr	recptr;
+ 	ErrorContextCallback errcallback;
+ 	instr_time	io_start;
+ 	Block		bufBlock;
++#ifdef USE_UMBRA
++	uint64		buf_state;
++	bool		checkpoint_needed = false;
++	bool		checkpoint_only = false;
++	bool		saved_checkpoint_slot_valid = false;
++	uint8		saved_checkpoint_slot = CKPT_BUFFER_SLOT_INVALID;
++#endif
+ 
+ 	Assert(BufferLockHeldByMeInMode(buf, BUFFER_LOCK_EXCLUSIVE) ||
+ 		   BufferLockHeldByMeInMode(buf, BUFFER_LOCK_SHARE_EXCLUSIVE));
+ 
++	if (checkpoint_slot != NULL)
++		*checkpoint_slot = CKPT_BUFFER_SLOT_INVALID;
++
+ 	/*
+ 	 * Try to start an I/O operation.  If StartBufferIO returns false, then
+ 	 * someone else flushed the buffer before we could, so we need not do
+ 	 * anything.
+ 	 */
+ 	if (StartSharedBufferIO(buf, false, true, NULL) == BUFFER_IO_ALREADY_DONE)
+-		return;
++		return false;
++
++#ifdef USE_UMBRA
++	buf_state = LockBufHdr(buf);
++	checkpoint_needed = (buf_state & BM_CHECKPOINT_NEEDED) != 0;
++	if (checkpoint_needed)
++	{
++		uint32		epoch_state;
++		uint32		checkpoint_epoch;
++
++		epoch_state = pg_atomic_read_u32(CkptBufferSlotCaptureEpoch);
++		checkpoint_epoch = epoch_state & CKPT_BUFFER_SLOT_EPOCH_MASK;
++		if (checkpoint_epoch != 0 &&
++			CkptBufferSlotEpochs[buf->buf_id] == checkpoint_epoch &&
++			CkptBufferSlots[buf->buf_id] != CKPT_BUFFER_SLOT_INVALID)
++		{
++			saved_checkpoint_slot = CkptBufferSlots[buf->buf_id];
++			saved_checkpoint_slot_valid = true;
++		}
++	}
++	UnlockBufHdr(buf);
++#endif
+ 
+ 	/* Setup error traceback support for ereport() */
+ 	errcallback.callback = shared_buffer_write_error_callback;
+@@ -4538,6 +4751,25 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
+ 	if (reln == NULL)
+ 		reln = smgropen(BufTagGetRelFileLocator(&buf->tag), INVALID_PROC_NUMBER);
+ 
++#ifdef USE_UMBRA
++	if (saved_checkpoint_slot_valid &&
++		UmUsesChunkPairedTranslation(reln, BufTagGetForkNum(&buf->tag)))
++	{
++		uint8		current_checkpoint_slot = CKPT_BUFFER_SLOT_INVALID;
++
++		if (UmCheckpointCaptureSlot(reln,
++									BufTagGetForkNum(&buf->tag),
++									buf->tag.blockNum,
++									&current_checkpoint_slot) &&
++			current_checkpoint_slot != saved_checkpoint_slot)
++		{
++			checkpoint_only = true;
++			if (checkpoint_slot != NULL)
++				*checkpoint_slot = saved_checkpoint_slot;
++		}
++	}
++#endif
++
+ 	TRACE_POSTGRESQL_BUFFER_FLUSH_START(BufTagGetForkNum(&buf->tag),
+ 										buf->tag.blockNum,
+ 										reln->smgr_rlocator.locator.spcOid,
+@@ -4583,6 +4815,15 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
+ 
+ 	io_start = pgstat_prepare_io_time(track_io_timing);
+ 
++#ifdef USE_UMBRA
++	if (checkpoint_only)
++		UmCheckpointWriteSlot(reln,
++							  BufTagGetForkNum(&buf->tag),
++							  buf->tag.blockNum,
++							  bufBlock,
++							  saved_checkpoint_slot);
++	else
++#endif
+ 	smgrwrite(reln,
+ 			  BufTagGetForkNum(&buf->tag),
+ 			  buf->tag.blockNum,
+@@ -4615,6 +4856,11 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
+ 	/*
+ 	 * Mark the buffer as clean and end the BM_IO_IN_PROGRESS state.
+ 	 */
++#ifdef USE_UMBRA
++	if (checkpoint_only)
++		TerminateCheckpointBufferIO(buf, true, false);
++	else
++#endif
+ 	TerminateBufferIO(buf, true, 0, true, false);
+ 
+ 	TRACE_POSTGRESQL_BUFFER_FLUSH_DONE(BufTagGetForkNum(&buf->tag),
+@@ -4625,23 +4871,49 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
+ 
+ 	/* Pop the error context stack */
+ 	error_context_stack = errcallback.previous;
++	return true;
+ }
+ 
+ /*
+  * Convenience wrapper around FlushBuffer() that locks/unlocks the buffer
+  * before/after calling FlushBuffer().
+  */
+-static void
++static bool
+ FlushUnlockedBuffer(BufferDesc *buf, SMgrRelation reln,
+-					IOObject io_object, IOContext io_context)
++					IOObject io_object, IOContext io_context,
++					uint8 *checkpoint_slot)
+ {
+ 	Buffer		buffer = BufferDescriptorGetBuffer(buf);
++	bool		flushed;
+ 
+ 	BufferLockAcquire(buffer, buf, BUFFER_LOCK_SHARE_EXCLUSIVE);
+-	FlushBuffer(buf, reln, io_object, io_context);
++	flushed = FlushBuffer(buf, reln, io_object, io_context, checkpoint_slot);
+ 	BufferLockUnlock(buffer, buf);
++	return flushed;
+ }
+ 
++#ifdef USE_UMBRA
++static uint32
++CkptBufferSlotActiveEpoch(void)
++{
++	uint32		epoch_state;
++
++	epoch_state = pg_atomic_read_u32(CkptBufferSlotCaptureEpoch);
++	if ((epoch_state & CKPT_BUFFER_SLOT_EPOCH_ACTIVE) == 0)
++		return 0;
++
++	return epoch_state & CKPT_BUFFER_SLOT_EPOCH_MASK;
++}
++
++static void
++ClearCheckpointBufferSlot(BufferDesc *buf)
++{
++	CkptBufferSlots[buf->buf_id] = CKPT_BUFFER_SLOT_INVALID;
++	CkptBufferSlotEpochs[buf->buf_id] = 0;
++}
++
++#endif
++
+ /*
+  * RelationGetNumberOfBlocksInFork
+  *		Determines the current number of pages in the specified relation fork.
+@@ -5238,7 +5510,8 @@ FlushRelationBuffers(Relation rel)
+ 			(buf_state & (BM_VALID | BM_DIRTY)) == (BM_VALID | BM_DIRTY))
+ 		{
+ 			PinBuffer_Locked(bufHdr);
+-			FlushUnlockedBuffer(bufHdr, srel, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
++			(void) FlushUnlockedBuffer(bufHdr, srel, IOOBJECT_RELATION,
++									   IOCONTEXT_NORMAL, NULL);
+ 			UnpinBuffer(bufHdr);
+ 		}
+ 		else
+@@ -5333,7 +5606,9 @@ FlushRelationsAllBuffers(SMgrRelation *smgrs, int nrels)
+ 			(buf_state & (BM_VALID | BM_DIRTY)) == (BM_VALID | BM_DIRTY))
+ 		{
+ 			PinBuffer_Locked(bufHdr);
+-			FlushUnlockedBuffer(bufHdr, srelent->srel, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
++			(void) FlushUnlockedBuffer(bufHdr, srelent->srel,
++									   IOOBJECT_RELATION, IOCONTEXT_NORMAL,
++									   NULL);
+ 			UnpinBuffer(bufHdr);
+ 		}
+ 		else
+@@ -5500,7 +5775,8 @@ CreateAndCopyRelationData(RelFileLocator src_rlocator,
  	{
  		if (smgrexists(src_rel, forkNum))
  		{
@@ -3179,7 +3966,7 @@ index cc398db124..d3c173d3fd 100644
  
  			/*
  			 * WAL log creation if the relation is persistent, or this is the
-@@ -5509,11 +5510,16 @@ CreateAndCopyRelationData(RelFileLocator src_rlocator,
+@@ -5509,11 +5785,16 @@ CreateAndCopyRelationData(RelFileLocator src_rlocator,
  			if (permanent || forkNum == INIT_FORKNUM)
  				log_smgrcreate(&dst_rlocator, forkNum);
  
@@ -3199,6 +3986,205 @@ index cc398db124..d3c173d3fd 100644
  }
  
  /* ---------------------------------------------------------------------
+@@ -5559,7 +5840,8 @@ FlushDatabaseBuffers(Oid dbid)
+ 			(buf_state & (BM_VALID | BM_DIRTY)) == (BM_VALID | BM_DIRTY))
+ 		{
+ 			PinBuffer_Locked(bufHdr);
+-			FlushUnlockedBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
++			(void) FlushUnlockedBuffer(bufHdr, NULL, IOOBJECT_RELATION,
++									   IOCONTEXT_NORMAL, NULL);
+ 			UnpinBuffer(bufHdr);
+ 		}
+ 		else
+@@ -5585,7 +5867,8 @@ FlushOneBuffer(Buffer buffer)
+ 
+ 	Assert(BufferIsLockedByMe(buffer));
+ 
+-	FlushBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
++	(void) FlushBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL,
++					   NULL);
+ }
+ 
+ /*
+@@ -7380,7 +7663,12 @@ TerminateBufferIO(BufferDesc *buf, bool clear_dirty, uint64 set_flag_bits,
+ 	unset_flag_bits |= BM_IO_ERROR;
+ 
+ 	if (clear_dirty)
++	{
+ 		unset_flag_bits |= BM_DIRTY | BM_CHECKPOINT_NEEDED;
++#ifdef USE_UMBRA
++		ClearCheckpointBufferSlot(buf);
++#endif
++	}
+ 
+ 	if (release_aio)
+ 	{
+@@ -7412,6 +7700,52 @@ TerminateBufferIO(BufferDesc *buf, bool clear_dirty, uint64 set_flag_bits,
+ 		WakePinCountWaiter(buf);
+ }
+ 
++#ifdef USE_UMBRA
++static void
++TerminateCheckpointBufferIO(BufferDesc *buf, bool forget_owner, bool release_aio)
++{
++	uint64		buf_state;
++	uint64		unset_flag_bits = 0;
++	int			refcount_change = 0;
++
++	buf_state = LockBufHdr(buf);
++
++	Assert(buf_state & BM_IO_IN_PROGRESS);
++	unset_flag_bits |= BM_IO_IN_PROGRESS;
++
++	/* Clear earlier errors, if this IO failed, it'll be marked again. */
++	unset_flag_bits |= BM_IO_ERROR;
++
++	/*
++	 * A checkpoint-slot write only satisfies the current checkpoint image.
++	 * The buffer is still dirty for the active slot and must be written later
++	 * by the normal path before BM_DIRTY can be cleared.
++	 */
++	unset_flag_bits |= BM_CHECKPOINT_NEEDED;
++	ClearCheckpointBufferSlot(buf);
++
++	if (release_aio)
++	{
++		Assert(BUF_STATE_GET_REFCOUNT(buf_state) > 0);
++		refcount_change = -1;
++		pgaio_wref_clear(&buf->io_wref);
++	}
++
++	buf_state = UnlockBufHdrExt(buf, buf_state,
++								0, unset_flag_bits,
++								refcount_change);
++
++	if (forget_owner)
++		ResourceOwnerForgetBufferIO(CurrentResourceOwner,
++									BufferDescriptorGetBuffer(buf));
++
++	ConditionVariableBroadcast(BufferDescriptorGetIOCV(buf));
++
++	if (release_aio && (buf_state & BM_PIN_COUNT_WAITER))
++		WakePinCountWaiter(buf);
++}
++#endif
++
+ /*
+  * AbortBufferIO: Clean up active buffer I/O after an error.
+  *
+@@ -7637,6 +7971,11 @@ ckpt_buforder_comparator(const CkptSortItem *a, const CkptSortItem *b)
+ 		return -1;
+ 	else if (a->tsId > b->tsId)
+ 		return 1;
++	/* compare database */
++	if (a->dbOid < b->dbOid)
++		return -1;
++	else if (a->dbOid > b->dbOid)
++		return 1;
+ 	/* compare relation */
+ 	if (a->relNumber < b->relNumber)
+ 		return -1;
+@@ -7698,6 +8037,17 @@ WritebackContextInit(WritebackContext *context, int *max_pending)
+ void
+ ScheduleBufferTagForWriteback(WritebackContext *wb_context, IOContext io_context,
+ 							  BufferTag *tag)
++{
++	ScheduleBufferTagForWritebackWithSlot(wb_context, io_context, tag,
++										  false, CKPT_BUFFER_SLOT_INVALID);
++}
++
++static void
++ScheduleBufferTagForWritebackWithSlot(WritebackContext *wb_context,
++									  IOContext io_context,
++									  BufferTag *tag,
++									  bool checkpoint_slot_valid,
++									  uint8 checkpoint_slot)
+ {
+ 	PendingWriteback *pending;
+ 
+@@ -7720,6 +8070,8 @@ ScheduleBufferTagForWriteback(WritebackContext *wb_context, IOContext io_context
+ 		pending = &wb_context->pending_writebacks[wb_context->nr_pending++];
+ 
+ 		pending->tag = *tag;
++		pending->checkpoint_slot_valid = checkpoint_slot_valid;
++		pending->checkpoint_slot = checkpoint_slot;
+ 	}
+ 
+ 	/*
+@@ -7731,9 +8083,33 @@ ScheduleBufferTagForWriteback(WritebackContext *wb_context, IOContext io_context
+ 		IssuePendingWritebacks(wb_context, io_context);
+ }
+ 
++static inline int
++pending_writeback_comparator(const PendingWriteback *a, const PendingWriteback *b)
++{
++	int			ret;
++
++	ret = buffertag_comparator(&a->tag, &b->tag);
++	if (ret != 0)
++		return ret;
++
++	if (!a->checkpoint_slot_valid && b->checkpoint_slot_valid)
++		return -1;
++	if (a->checkpoint_slot_valid && !b->checkpoint_slot_valid)
++		return 1;
++	if (a->checkpoint_slot_valid && b->checkpoint_slot_valid)
++	{
++		if (a->checkpoint_slot < b->checkpoint_slot)
++			return -1;
++		if (a->checkpoint_slot > b->checkpoint_slot)
++			return 1;
++	}
++
++	return 0;
++}
++
+ #define ST_SORT sort_pending_writebacks
+ #define ST_ELEMENT_TYPE PendingWriteback
+-#define ST_COMPARE(a, b) buffertag_comparator(&a->tag, &b->tag)
++#define ST_COMPARE(a, b) pending_writeback_comparator(a, b)
+ #define ST_SCOPE static
+ #define ST_DEFINE
+ #include "lib/sort_template.h"
+@@ -7782,6 +8158,16 @@ IssuePendingWritebacks(WritebackContext *wb_context, IOContext io_context)
+ 		tag = cur->tag;
+ 		currlocator = BufTagGetRelFileLocator(&tag);
+ 
++#ifdef USE_UMBRA
++		if (cur->checkpoint_slot_valid)
++		{
++			reln = smgropen(currlocator, INVALID_PROC_NUMBER);
++			UmCheckpointWritebackSlot(reln, BufTagGetForkNum(&tag),
++									  tag.blockNum, cur->checkpoint_slot);
++			continue;
++		}
++#endif
++
+ 		/*
+ 		 * Peek ahead, into following writeback requests, to see if they can
+ 		 * be combined with the current one.
+@@ -7791,6 +8177,11 @@ IssuePendingWritebacks(WritebackContext *wb_context, IOContext io_context)
+ 
+ 			next = &wb_context->pending_writebacks[i + ahead + 1];
+ 
++#ifdef USE_UMBRA
++			if (next->checkpoint_slot_valid)
++				break;
++#endif
++
+ 			/* different file, stop */
+ 			if (!RelFileLocatorEquals(currlocator,
+ 									  BufTagGetRelFileLocator(&next->tag)) ||
+@@ -7925,7 +8316,8 @@ EvictUnpinnedBufferInternal(BufferDesc *desc, bool *buffer_flushed)
+ 	/* If it was dirty, try to clean it once. */
+ 	if (buf_state & BM_DIRTY)
+ 	{
+-		FlushUnlockedBuffer(desc, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
++		(void) FlushUnlockedBuffer(desc, NULL, IOOBJECT_RELATION,
++								   IOCONTEXT_NORMAL, NULL);
+ 		*buffer_flushed = true;
+ 	}
+ 
 diff --git a/src/backend/storage/map/Makefile b/src/backend/storage/map/Makefile
 new file mode 100644
 index 0000000000..c56e80d323
@@ -5760,10 +6746,10 @@ index 0000000000..65ecde1409
 +}
 diff --git a/src/backend/storage/map/mapsuper.c b/src/backend/storage/map/mapsuper.c
 new file mode 100644
-index 0000000000..bdd13b482f
+index 0000000000..fee6a78b68
 --- /dev/null
 +++ b/src/backend/storage/map/mapsuper.c
-@@ -0,0 +1,1639 @@
+@@ -0,0 +1,1685 @@
 +/*-------------------------------------------------------------------------
 + *
 + * mapsuper.c
@@ -5852,6 +6838,12 @@ index 0000000000..bdd13b482f
 +									RelFileLocator rnode,
 +									bool pending,
 +									XLogRecPtr map_lsn);
++static bool MapSBlockEnsurePhysicalNblocksInternal(UmbraFileContext *map_ctx,
++												   RelFileLocator rnode,
++												   ForkNumber forknum,
++												   BlockNumber nblocks,
++												   bool skipFsync,
++												   bool zero_fill);
 +void MapSBlockBumpPhysicalState(UmbraFileContext *map_ctx,
 +								RelFileLocator rnode,
 +								ForkNumber forknum,
@@ -6907,6 +7899,29 @@ index 0000000000..bdd13b482f
 +							   ForkNumber forknum, BlockNumber nblocks,
 +							   bool skipFsync)
 +{
++	return MapSBlockEnsurePhysicalNblocksInternal(map_ctx, rnode, forknum,
++												  nblocks, skipFsync, false);
++}
++
++bool
++MapSBlockEnsurePhysicalNblocksZeroFill(UmbraFileContext *map_ctx,
++									   RelFileLocator rnode,
++									   ForkNumber forknum,
++									   BlockNumber nblocks,
++									   bool skipFsync)
++{
++	return MapSBlockEnsurePhysicalNblocksInternal(map_ctx, rnode, forknum,
++												  nblocks, skipFsync, true);
++}
++
++static bool
++MapSBlockEnsurePhysicalNblocksInternal(UmbraFileContext *map_ctx,
++									   RelFileLocator rnode,
++									   ForkNumber forknum,
++									   BlockNumber nblocks,
++									   bool skipFsync,
++									   bool zero_fill)
++{
 +	MapSuperEntry *entry;
 +	uint32		extend_flag;
 +	BlockNumber	current;
@@ -6960,12 +7975,29 @@ index 0000000000..bdd13b482f
 +
 +		for (;;)
 +		{
-+			if (!umfile_ctx_preallocate_blocks(map_ctx, forknum, desired,
-+											   skipFsync) &&
-+				!umfile_ctx_block_exists(map_ctx, forknum, desired - 1))
++			if (zero_fill)
 +			{
-+				PGIOAlignedBlock zero_buffer = {0};
++				current = MapNormalizeForkBlockCount(forknum, current);
++				if (current < desired)
++				{
++					BlockNumber zero_start = current;
 +
++					while (zero_start < desired)
++					{
++						int			zero_blocks;
++
++						zero_blocks = (int) Min(desired - zero_start,
++												 (BlockNumber) INT_MAX);
++						umfile_zeroextend(map_ctx, forknum, zero_start,
++										  zero_blocks, skipFsync);
++						zero_start += (BlockNumber) zero_blocks;
++					}
++				}
++			}
++			else if (!umfile_ctx_preallocate_blocks(map_ctx, forknum, desired,
++												   skipFsync) &&
++					 !umfile_ctx_block_exists(map_ctx, forknum, desired - 1))
++			{
 +				/*
 +				 * Fall back to making EOF cover the published physical capacity
 +				 * when the platform cannot preallocate the range. Sparse holes
@@ -6973,8 +8005,8 @@ index 0000000000..bdd13b482f
 +				 * avoid later EOF/short reads without forcing every intervening
 +				 * page through the foreground extension path.
 +				 */
-+				umfile_extend(map_ctx, forknum, desired - 1,
-+							  zero_buffer.data, skipFsync);
++				umfile_zeroextend(map_ctx, forknum, desired - 1,
++								  1, skipFsync);
 +			}
 +
 +			if (!MapSuperPrepareEntryForUpdate(map_ctx, rnode, InvalidXLogRecPtr,
@@ -8012,10 +9044,10 @@ index 5391640d86..8ba29edc56 100644
  	}
 diff --git a/src/backend/storage/smgr/umbra.c b/src/backend/storage/smgr/umbra.c
 new file mode 100644
-index 0000000000..884404bc3c
+index 0000000000..8c4fc085d8
 --- /dev/null
 +++ b/src/backend/storage/smgr/umbra.c
-@@ -0,0 +1,2626 @@
+@@ -0,0 +1,2829 @@
 +/*-------------------------------------------------------------------------
 + *
 + * umbra.c
@@ -8069,6 +9101,9 @@ index 0000000000..884404bc3c
 +#include "utils/hsearch.h"
 +#include "utils/memutils.h"
 +#include "utils/wait_event.h"
++
++bool		umbra_chunk_zero_fill_all_slots = true;
++bool		umbra_exp2_c3_pause = false;
 +
 +typedef struct UmbraAccessState
 +{
@@ -8232,6 +9267,9 @@ index 0000000000..884404bc3c
 +													  const UmbraAccessState *access,
 +													  BlockNumber pblkno,
 +													  bool skipFsync);
++static void um_zeroextend_flush_run(UmbraFileContext *ctx, ForkNumber forknum,
++									BlockNumber *run_start_pblk,
++									int *run_len, bool skipFsync);
 +static bool um_fork_uses_map_translation(ForkNumber forknum);
 +static bool um_mapped_exists_from_super(SMgrRelation reln, ForkNumber forknum);
 +static UmbraMapPolicy um_open_map_state(SMgrRelation reln);
@@ -8385,6 +9423,22 @@ index 0000000000..884404bc3c
 +											  reln->smgr_rlocator.locator,
 +											  forknum, pblkno + 1,
 +											  skipFsync);
++}
++
++static void
++um_zeroextend_flush_run(UmbraFileContext *ctx, ForkNumber forknum,
++						BlockNumber *run_start_pblk,
++						int *run_len, bool skipFsync)
++{
++	Assert(run_start_pblk != NULL);
++	Assert(run_len != NULL);
++
++	if (*run_len <= 0)
++		return;
++
++	umfile_zeroextend(ctx, forknum, *run_start_pblk, *run_len, skipFsync);
++	*run_start_pblk = InvalidBlockNumber;
++	*run_len = 0;
 +}
 +
 +/*
@@ -8819,22 +9873,35 @@ index 0000000000..884404bc3c
 +								  bool skipFsync)
 +{
 +	BlockNumber physical_nblocks;
++	bool		materialized;
 +
 +	physical_nblocks =
 +		um_chunk_physical_capacity_checked(reln, forknum, logical_nblocks);
 +	if (physical_nblocks == 0)
 +		return;
 +
-+	if (!MapSBlockEnsurePhysicalNblocks(ctx, reln->smgr_rlocator.locator,
-+										forknum, physical_nblocks,
-+										skipFsync))
-+		ereport(ERROR,
-+				(errcode(ERRCODE_DATA_CORRUPTED),
-+				 errmsg("could not materialize chunk-paired physical capacity for relation %u/%u/%u fork %d",
-+						reln->smgr_rlocator.locator.spcOid,
-+						reln->smgr_rlocator.locator.dbOid,
-+						reln->smgr_rlocator.locator.relNumber,
-+						forknum)));
++	if (umbra_chunk_zero_fill_all_slots)
++		materialized = MapSBlockEnsurePhysicalNblocksZeroFill(ctx,
++															  reln->smgr_rlocator.locator,
++															  forknum,
++															  physical_nblocks,
++															  skipFsync);
++	else
++		materialized = MapSBlockEnsurePhysicalNblocks(ctx,
++													  reln->smgr_rlocator.locator,
++													  forknum,
++													  physical_nblocks,
++													  skipFsync);
++	if (materialized)
++		return;
++
++	ereport(ERROR,
++			(errcode(ERRCODE_DATA_CORRUPTED),
++			 errmsg("could not materialize chunk-paired physical capacity for relation %u/%u/%u fork %d",
++					reln->smgr_rlocator.locator.spcOid,
++					reln->smgr_rlocator.locator.dbOid,
++					reln->smgr_rlocator.locator.relNumber,
++					forknum)));
 +}
 +
 +static void
@@ -9448,6 +10515,125 @@ index 0000000000..884404bc3c
 +	return false;
 +}
 +
++bool
++UmTranslationPhysicalBlockExists(SMgrRelation reln, ForkNumber forknum,
++								 BlockNumber lblkno)
++{
++	UmbraAccessState access;
++	UmbraFileContext *ctx = um_ctx_acquire(reln);
++	BlockNumber	pblk;
++
++	access = um_classify_access(reln, forknum);
++	if (um_state_uses_chunk_base(access.policy))
++	{
++		if (!UmTranslationTryLookupPblkno(reln, forknum, lblkno, &pblk))
++			return false;
++		return umfile_ctx_block_exists(ctx, forknum, pblk);
++	}
++
++	if (!access.map_available)
++		return umfile_ctx_block_exists(ctx, forknum, lblkno);
++
++	return false;
++}
++
++bool
++UmTranslationSlotPhysicalBlockExists(SMgrRelation reln, ForkNumber forknum,
++									 BlockNumber lblkno, uint8 slot)
++{
++	UmbraAccessState access;
++	UmbraFileContext *ctx = um_ctx_acquire(reln);
++	BlockNumber	logical_nblocks;
++	BlockNumber	pblk;
++
++	if (!UmbraChunkActiveSlotIsValid(slot))
++		return false;
++
++	access = um_classify_access(reln, forknum);
++	if (!um_state_uses_chunk_base(access.policy))
++		return UmTranslationPhysicalBlockExists(reln, forknum, lblkno);
++
++	if (!MapSBlockTryGetLogicalNblocks(ctx, reln->smgr_rlocator.locator,
++									   forknum, &logical_nblocks) ||
++		lblkno >= logical_nblocks)
++		return false;
++
++	pblk = um_chunk_slot_pblk_checked(reln, forknum, lblkno, slot);
++	return umfile_ctx_block_exists(ctx, forknum, pblk);
++}
++
++bool
++UmCheckpointCaptureSlot(SMgrRelation reln, ForkNumber forknum,
++						BlockNumber lblkno, uint8 *checkpoint_slot)
++{
++	UmbraAccessState access;
++	UmbraFileContext *ctx = um_ctx_acquire(reln);
++	uint8		active_slot = 0;
++
++	Assert(checkpoint_slot != NULL);
++
++	access = um_classify_access(reln, forknum);
++	if (!um_state_uses_chunk_base(access.policy))
++		return false;
++
++	if (lblkno >= umnblocks_for_access(reln, forknum, &access))
++		return false;
++
++	(void) UmbraShiftGet(ctx, reln->smgr_rlocator.locator,
++						 forknum, lblkno, &active_slot);
++	*checkpoint_slot = active_slot;
++	return true;
++}
++
++void
++UmCheckpointWriteSlot(SMgrRelation reln, ForkNumber forknum,
++					  BlockNumber lblkno, const void *buffer,
++					  uint8 checkpoint_slot)
++{
++	UmbraAccessState access;
++	UmbraFileContext *ctx = um_ctx_acquire(reln);
++	BlockNumber		pblk;
++
++	if (!UmbraChunkActiveSlotIsValid(checkpoint_slot))
++		elog(ERROR, "invalid Umbra checkpoint slot %u", checkpoint_slot);
++
++	access = um_classify_access(reln, forknum);
++	if (!um_state_uses_chunk_base(access.policy))
++		elog(ERROR,
++			 "checkpoint slot write requested for non-chunk Umbra relation %u/%u/%u fork %d block %u",
++			 reln->smgr_rlocator.locator.spcOid,
++			 reln->smgr_rlocator.locator.dbOid,
++			 reln->smgr_rlocator.locator.relNumber,
++			 forknum, lblkno);
++
++	um_ensure_chunk_physical_capacity(reln, forknum, ctx, lblkno + 1,
++									  false);
++	pblk = um_chunk_slot_pblk_checked(reln, forknum, lblkno,
++									  checkpoint_slot);
++	umfile_ctx_ensure_block_exists(ctx, forknum, pblk);
++	umfile_writev(ctx, forknum, pblk, &buffer, 1, false);
++}
++
++void
++UmCheckpointWritebackSlot(SMgrRelation reln, ForkNumber forknum,
++						  BlockNumber lblkno, uint8 checkpoint_slot)
++{
++	UmbraAccessState access;
++	UmbraFileContext *ctx = um_ctx_acquire(reln);
++	BlockNumber		pblk;
++
++	if (!UmbraChunkActiveSlotIsValid(checkpoint_slot))
++		return;
++
++	access = um_classify_access(reln, forknum);
++	if (!um_state_uses_chunk_base(access.policy))
++		return;
++
++	pblk = um_chunk_slot_pblk_checked(reln, forknum, lblkno,
++									  checkpoint_slot);
++	umfile_writeback(ctx, forknum, pblk, 1);
++}
++
 +uint8
 +UmShiftChooseTargetSlot(SMgrRelation reln, ForkNumber forknum, BlockNumber lblkno,
 +						uint8 *source_slot)
@@ -9731,7 +10917,10 @@ index 0000000000..884404bc3c
 +
 +	if (um_state_uses_chunk_direct_base(access.policy))
 +	{
++		BlockNumber logical_nblocks;
 +		BlockNumber logical_end = blocknum + (BlockNumber) nblocks;
++		BlockNumber old_physical_nblocks = InvalidBlockNumber;
++		bool		skip_new_capacity_zero;
 +
 +		if (logical_end < blocknum)
 +			ereport(ERROR,
@@ -9742,6 +10931,21 @@ index 0000000000..884404bc3c
 +							reln->smgr_rlocator.locator.relNumber,
 +							forknum)));
 +
++		logical_nblocks = umnblocks_for_access(reln, forknum, &access);
++		if (blocknum != logical_nblocks)
++			ereport(ERROR,
++					(errcode(ERRCODE_DATA_CORRUPTED),
++					 errmsg("cannot zero-extend Umbra relation %u/%u/%u fork %d from block %u with logical EOF %u",
++							reln->smgr_rlocator.locator.spcOid,
++							reln->smgr_rlocator.locator.dbOid,
++							reln->smgr_rlocator.locator.relNumber,
++							forknum, blocknum, logical_nblocks)));
++
++		skip_new_capacity_zero = umbra_chunk_zero_fill_all_slots;
++		if (skip_new_capacity_zero &&
++			!MapSBlockTryGetPhysicalNblocks(ctx, reln->smgr_rlocator.locator,
++											forknum, &old_physical_nblocks))
++			old_physical_nblocks = 0;
 +		um_ensure_chunk_physical_capacity(reln, forknum, ctx,
 +										  logical_end, skipFsync);
 +		run_start_pblk = InvalidBlockNumber;
@@ -9751,6 +10955,13 @@ index 0000000000..884404bc3c
 +		{
 +			BlockNumber pblk = um_chunk_base_pblk_checked(reln, forknum,
 +														 blocknum + (BlockNumber) i);
++
++			if (skip_new_capacity_zero && pblk >= old_physical_nblocks)
++			{
++				um_zeroextend_flush_run(ctx, forknum, &run_start_pblk,
++										&run_len, skipFsync);
++				continue;
++			}
 +
 +			if (run_len == 0)
 +			{
@@ -9763,16 +10974,15 @@ index 0000000000..884404bc3c
 +			}
 +			else
 +			{
-+				umfile_zeroextend(ctx, forknum, run_start_pblk,
-+								  run_len, skipFsync);
++				um_zeroextend_flush_run(ctx, forknum, &run_start_pblk,
++										&run_len, skipFsync);
 +				run_start_pblk = pblk;
 +				run_len = 1;
 +			}
 +		}
 +
-+		if (run_len > 0)
-+			umfile_zeroextend(ctx, forknum, run_start_pblk, run_len,
-+							  skipFsync);
++		um_zeroextend_flush_run(ctx, forknum, &run_start_pblk, &run_len,
++								skipFsync);
 +
 +		MapSBlockBumpLogicalNblocks(ctx, reln->smgr_rlocator.locator,
 +									forknum, logical_end,
@@ -9803,7 +11013,9 @@ index 0000000000..884404bc3c
 +	{
 +		BlockNumber logical_nblocks;
 +		BlockNumber logical_end = blocknum + (BlockNumber) nblocks;
++		BlockNumber old_physical_nblocks = InvalidBlockNumber;
 +		bool		extends_logical;
++		bool		skip_new_capacity_zero = false;
 +
 +		if (logical_end < blocknum)
 +			ereport(ERROR,
@@ -9816,10 +11028,25 @@ index 0000000000..884404bc3c
 +
 +		logical_nblocks = umnblocks_for_access(reln, forknum, &access);
 +		extends_logical = logical_end > logical_nblocks;
++		if (blocknum != logical_nblocks)
++			ereport(ERROR,
++					(errcode(ERRCODE_DATA_CORRUPTED),
++					 errmsg("cannot zero-extend Umbra relation %u/%u/%u fork %d from block %u with logical EOF %u",
++							reln->smgr_rlocator.locator.spcOid,
++							reln->smgr_rlocator.locator.dbOid,
++							reln->smgr_rlocator.locator.relNumber,
++							forknum, blocknum, logical_nblocks)));
 +		if (extends_logical)
++		{
++			skip_new_capacity_zero = umbra_chunk_zero_fill_all_slots;
++			if (skip_new_capacity_zero &&
++				!MapSBlockTryGetPhysicalNblocks(ctx, reln->smgr_rlocator.locator,
++												forknum, &old_physical_nblocks))
++				old_physical_nblocks = 0;
 +			um_ensure_chunk_physical_capacity(reln, forknum, ctx,
 +											  logical_end,
 +											  true /* skipFsync */);
++		}
 +
 +		for (int i = 0; i < nblocks; i++)
 +		{
@@ -9834,6 +11061,15 @@ index 0000000000..884404bc3c
 +			if (max_pblkno == InvalidBlockNumber || pblk > max_pblkno)
 +				max_pblkno = pblk;
 +
++			if (skip_new_capacity_zero &&
++				lblk >= logical_nblocks &&
++				pblk >= old_physical_nblocks)
++			{
++				um_zeroextend_flush_run(ctx, forknum, &run_start_pblk,
++										&run_len, skipFsync);
++				continue;
++			}
++
 +			if (run_len == 0)
 +			{
 +				run_start_pblk = pblk;
@@ -9845,16 +11081,15 @@ index 0000000000..884404bc3c
 +			}
 +			else
 +			{
-+				umfile_zeroextend(ctx, forknum, run_start_pblk,
-+								  run_len, skipFsync);
++				um_zeroextend_flush_run(ctx, forknum, &run_start_pblk,
++										&run_len, skipFsync);
 +				run_start_pblk = pblk;
 +				run_len = 1;
 +			}
 +		}
 +
-+		if (run_len > 0)
-+			umfile_zeroextend(ctx, forknum, run_start_pblk, run_len,
-+							  skipFsync);
++		um_zeroextend_flush_run(ctx, forknum, &run_start_pblk, &run_len,
++								skipFsync);
 +
 +		if (max_pblkno != InvalidBlockNumber)
 +			MapSBlockBumpPhysicalNblocks(ctx, reln->smgr_rlocator.locator,
@@ -13083,7 +14318,7 @@ index c1457eb34f..6a0c863efb 100644
  	 * Initialize the relation cache and the system catalog caches.  Note that
  	 * no catalog access happens here; we only set up the hashtable structure.
 diff --git a/src/backend/utils/misc/guc_parameters.dat b/src/backend/utils/misc/guc_parameters.dat
-index afaa058b04..ec54c3a5e4 100644
+index afaa058b04..70e22ebddd 100644
 --- a/src/backend/utils/misc/guc_parameters.dat
 +++ b/src/backend/utils/misc/guc_parameters.dat
 @@ -1959,6 +1959,45 @@
@@ -13132,8 +14367,30 @@ index afaa058b04..ec54c3a5e4 100644
  { name => 'max_active_replication_origins', type => 'int', context => 'PGC_POSTMASTER', group => 'REPLICATION_SUBSCRIBERS',
    short_desc => 'Sets the maximum number of active replication origins.',
    variable => 'max_active_replication_origins',
+@@ -3280,6 +3319,21 @@
+   boot_val => 'false',
+ },
+ 
++{ name => 'umbra_chunk_zero_fill_all_slots', type => 'bool', context => 'PGC_SIGHUP', group => 'RESOURCES_BGWRITER',
++  short_desc => 'Zero-fill all Umbra chunk physical slots before publishing physical capacity.',
++  variable => 'umbra_chunk_zero_fill_all_slots',
++  boot_val => 'true',
++  ifdef => 'USE_UMBRA',
++},
++
++{ name => 'umbra_exp2_c3_pause', type => 'bool', context => 'PGC_SUSET', group => 'DEVELOPER_OPTIONS',
++  short_desc => 'Pauses Umbra block-shift insertion after WAL insert and before MAP publication.',
++  flags => 'GUC_NOT_IN_SAMPLE',
++  variable => 'umbra_exp2_c3_pause',
++  boot_val => 'false',
++  ifdef => 'USE_UMBRA',
++},
++
+ { name => 'unix_socket_directories', type => 'string', context => 'PGC_POSTMASTER', group => 'CONN_AUTH_SETTINGS',
+   short_desc => 'Sets the directories where Unix-domain sockets will be created.',
+   flags => 'GUC_LIST_INPUT | GUC_LIST_QUOTE | GUC_SUPERUSER_ONLY',
 diff --git a/src/backend/utils/misc/guc_tables.c b/src/backend/utils/misc/guc_tables.c
-index 290ccbc543..8d87958923 100644
+index 290ccbc543..3b481503ca 100644
 --- a/src/backend/utils/misc/guc_tables.c
 +++ b/src/backend/utils/misc/guc_tables.c
 @@ -67,6 +67,7 @@
@@ -13144,7 +14401,7 @@ index 290ccbc543..8d87958923 100644
  #include "postmaster/postmaster.h"
  #include "postmaster/startup.h"
  #include "postmaster/syslogger.h"
-@@ -83,6 +84,7 @@
+@@ -83,11 +84,13 @@
  #include "storage/fd.h"
  #include "storage/io_worker.h"
  #include "storage/large_object.h"
@@ -13152,6 +14409,12 @@ index 290ccbc543..8d87958923 100644
  #include "storage/pg_shmem.h"
  #include "storage/predicate.h"
  #include "storage/proc.h"
+ #include "storage/procnumber.h"
+ #include "storage/standby.h"
++#include "storage/umbra.h"
+ #include "tcop/backend_startup.h"
+ #include "tcop/tcopprot.h"
+ #include "portability/instr_time.h"
 diff --git a/src/backend/utils/misc/postgresql.conf.sample b/src/backend/utils/misc/postgresql.conf.sample
 index ac38cddaaf..9743bd368c 100644
 --- a/src/backend/utils/misc/postgresql.conf.sample
@@ -13494,6 +14757,56 @@ index 17b59aeed7..d07911673c 100644
  		BlockNumber nblocks;
  		ForkNumber	forkNum:8;	/* don't waste 4 byte for four values */
  		bool		is_temp:1;	/* proc can be inferred by owning AIO */
+diff --git a/src/include/storage/buf_internals.h b/src/include/storage/buf_internals.h
+index 89615a254a..097506b47b 100644
+--- a/src/include/storage/buf_internals.h
++++ b/src/include/storage/buf_internals.h
+@@ -394,6 +394,8 @@ typedef struct PendingWriteback
+ {
+ 	/* could store different types of pending flushes here */
+ 	BufferTag	tag;
++	bool		checkpoint_slot_valid;
++	uint8		checkpoint_slot;
+ } PendingWriteback;
+ 
+ /* struct forward declared in bufmgr.h */
+@@ -413,6 +415,12 @@ typedef struct WritebackContext
+ extern PGDLLIMPORT BufferDescPadded *BufferDescriptors;
+ extern PGDLLIMPORT ConditionVariableMinimallyPadded *BufferIOCVArray;
+ extern PGDLLIMPORT WritebackContext BackendWritebackContext;
++#define CKPT_BUFFER_SLOT_INVALID	((uint8) 0xFF)
++#ifdef USE_UMBRA
++extern PGDLLIMPORT uint8 *CkptBufferSlots;
++extern PGDLLIMPORT uint32 *CkptBufferSlotEpochs;
++extern PGDLLIMPORT pg_atomic_uint32 *CkptBufferSlotCaptureEpoch;
++#endif
+ 
+ /* in localbuf.c */
+ extern PGDLLIMPORT BufferDesc *LocalBufferDescriptors;
+@@ -509,6 +517,7 @@ extern uint64 WaitBufHdrUnlocked(BufferDesc *buf);
+ typedef struct CkptSortItem
+ {
+ 	Oid			tsId;
++	Oid			dbOid;
+ 	RelFileNumber relNumber;
+ 	ForkNumber	forkNum;
+ 	BlockNumber blockNum;
+diff --git a/src/include/storage/bufmgr.h b/src/include/storage/bufmgr.h
+index 6837b35fc6..cc48bf6e07 100644
+--- a/src/include/storage/bufmgr.h
++++ b/src/include/storage/bufmgr.h
+@@ -288,6 +288,11 @@ extern void AtEOXact_Buffers(bool isCommit);
+ extern void AssertBufferLocksPermitCatalogRead(void);
+ #endif
+ extern char *DebugPrintBufferRefcount(Buffer buffer);
++#ifdef USE_UMBRA
++extern void CheckPointBuffersCaptureBegin(void);
++extern void CheckPointBuffersPrepare(int flags);
++extern void BufferSaveCheckpointSlot(Buffer buffer, uint8 checkpoint_slot);
++#endif
+ extern void CheckPointBuffers(int flags);
+ extern BlockNumber BufferGetBlockNumber(Buffer buffer);
+ extern BlockNumber RelationGetNumberOfBlocksInFork(Relation relation,
 diff --git a/src/include/storage/lwlocklist.h b/src/include/storage/lwlocklist.h
 index d7eb648bd2..6c88845b96 100644
 --- a/src/include/storage/lwlocklist.h
@@ -13508,10 +14821,10 @@ index d7eb648bd2..6c88845b96 100644
  PG_LWLOCKTRANCHE(PARALLEL_HASH_JOIN, ParallelHashJoin)
 diff --git a/src/include/storage/map.h b/src/include/storage/map.h
 new file mode 100644
-index 0000000000..5a169d873e
+index 0000000000..6711ecc4e1
 --- /dev/null
 +++ b/src/include/storage/map.h
-@@ -0,0 +1,254 @@
+@@ -0,0 +1,259 @@
 +/*-------------------------------------------------------------------------
 + *
 + * map.h
@@ -13691,6 +15004,11 @@ index 0000000000..5a169d873e
 +										   ForkNumber forknum,
 +										   BlockNumber nblocks,
 +										   bool skipFsync);
++extern bool MapSBlockEnsurePhysicalNblocksZeroFill(UmbraFileContext *map_ctx,
++												   RelFileLocator rnode,
++												   ForkNumber forknum,
++												   BlockNumber nblocks,
++												   bool skipFsync);
 +extern void MapSBlockBumpNextFreePhysBlock(UmbraFileContext *map_ctx,
 +										   RelFileLocator rnode,
 +										   ForkNumber forknum,
@@ -14220,10 +15538,10 @@ index 0000000000..b7ad5f4490
 +#endif							/* UM_DEFS_H */
 diff --git a/src/include/storage/umbra.h b/src/include/storage/umbra.h
 new file mode 100644
-index 0000000000..9a5c62da94
+index 0000000000..738c8b913f
 --- /dev/null
 +++ b/src/include/storage/umbra.h
-@@ -0,0 +1,266 @@
+@@ -0,0 +1,290 @@
 +/*-------------------------------------------------------------------------
 + *
 + * umbra.h
@@ -14245,6 +15563,9 @@ index 0000000000..9a5c62da94
 +#include "storage/smgr.h"
 +#include "storage/sync.h"
 +#include "storage/um_defs.h"
++
++extern PGDLLIMPORT bool umbra_chunk_zero_fill_all_slots;
++extern PGDLLIMPORT bool umbra_exp2_c3_pause;
 +
 +/*
 + * Umbra MAP policy.
@@ -14291,7 +15612,13 @@ index 0000000000..9a5c62da94
 + * Each logical page is born on slot 0.  Later rewrites rotate the active slot
 + * through the metadata stored for that logical block.
 + */
++#ifndef UMBRA_CHUNK_PAIRED_PAGES
 +#define UMBRA_CHUNK_PAIRED_PAGES 32U
++#endif
++#if UMBRA_CHUNK_PAIRED_PAGES <= 0
++#error "UMBRA_CHUNK_PAIRED_PAGES must be greater than zero"
++#endif
++
 +#define UMBRA_CHUNK_ACTIVE_SLOTS 3U
 +
 +static inline bool
@@ -14479,6 +15806,21 @@ index 0000000000..9a5c62da94
 +extern bool UmUsesChunkPairedTranslation(SMgrRelation reln, ForkNumber forknum);
 +extern bool UmTranslationTryLookupPblkno(SMgrRelation reln, ForkNumber forknum,
 +										BlockNumber lblkno, BlockNumber *pblkno);
++extern bool UmTranslationPhysicalBlockExists(SMgrRelation reln,
++											 ForkNumber forknum,
++											 BlockNumber lblkno);
++extern bool UmTranslationSlotPhysicalBlockExists(SMgrRelation reln,
++												 ForkNumber forknum,
++												 BlockNumber lblkno,
++												 uint8 slot);
++extern bool UmCheckpointCaptureSlot(SMgrRelation reln, ForkNumber forknum,
++									BlockNumber lblkno, uint8 *checkpoint_slot);
++extern void UmCheckpointWriteSlot(SMgrRelation reln, ForkNumber forknum,
++								  BlockNumber lblkno, const void *buffer,
++								  uint8 checkpoint_slot);
++extern void UmCheckpointWritebackSlot(SMgrRelation reln, ForkNumber forknum,
++									  BlockNumber lblkno,
++									  uint8 checkpoint_slot);
 +extern uint8 UmShiftChooseTargetSlot(SMgrRelation reln, ForkNumber forknum,
 +									 BlockNumber lblkno, uint8 *source_slot);
 +extern void UmShiftSetActiveSlot(SMgrRelation reln, ForkNumber forknum,
@@ -14606,10 +15948,10 @@ index 0000000000..b43719607c
 +
 +#endif							/* UMFILE_H */
 diff --git a/src/test/recovery/meson.build b/src/test/recovery/meson.build
-index 9eb8ed1142..378e148c92 100644
+index 9eb8ed1142..6573d42aec 100644
 --- a/src/test/recovery/meson.build
 +++ b/src/test/recovery/meson.build
-@@ -62,6 +62,23 @@ tests += {
+@@ -62,6 +62,24 @@ tests += {
        't/051_effective_wal_level.pl',
        't/052_checkpoint_segment_missing.pl',
        't/053_standby_login_event_trigger.pl',
@@ -14630,15 +15972,16 @@ index 9eb8ed1142..378e148c92 100644
 +      't/079_umbra_ordinary_slim_block_remap.pl',
 +      't/081_umbra_torn_page_remap.pl',
 +      't/082_umbra_chunk_paired_smoke.pl',
++      't/083_umbra_chunk_checkpoint_publication.pl',
      ],
    },
  }
 diff --git a/src/test/recovery/t/060_umbra_map_superblock_watermark.pl b/src/test/recovery/t/060_umbra_map_superblock_watermark.pl
 new file mode 100644
-index 0000000000..2f6ed8f646
+index 0000000000..81052463d2
 --- /dev/null
 +++ b/src/test/recovery/t/060_umbra_map_superblock_watermark.pl
-@@ -0,0 +1,116 @@
+@@ -0,0 +1,120 @@
 +# Verify MAP superblock watermarks don't regress across crash restart.
 +#
 +# This test is UMBRA-specific. In md mode there is no MAP fork, so skip.
@@ -14664,8 +16007,12 @@ index 0000000000..2f6ed8f646
 +	  (hex($b[3]) << 24);
 +}
 +
-+my $chunk_pages = 32;
-+my $active_slots = 3;
++my ($chunk_pages) =
++  scan_server_header('storage/umbra.h',
++	q{#define UMBRA_CHUNK_PAIRED_PAGES ([0-9]+)U});
++my ($active_slots) =
++  scan_server_header('storage/umbra.h',
++	q{#define UMBRA_CHUNK_ACTIVE_SLOTS ([0-9]+)U});
 +
 +sub chunk_capacity_for_nblocks
 +{
@@ -15821,10 +17168,10 @@ index 0000000000..21b76470a7
 +done_testing();
 diff --git a/src/test/recovery/t/079_umbra_ordinary_slim_block_remap.pl b/src/test/recovery/t/079_umbra_ordinary_slim_block_remap.pl
 new file mode 100644
-index 0000000000..2ba527a14c
+index 0000000000..2c2ffced69
 --- /dev/null
 +++ b/src/test/recovery/t/079_umbra_ordinary_slim_block_remap.pl
-@@ -0,0 +1,134 @@
+@@ -0,0 +1,136 @@
 +# Copyright (c) 2026, PostgreSQL Global Development Group
 +
 +use strict;
@@ -15948,23 +17295,25 @@ index 0000000000..2ba527a14c
 +my @shift_header_lines_1 = shift_header_lines($dump_stdout_1, $locator);
 +my @shift_header_lines_2 = shift_header_lines($dump_stdout_2, $locator);
 +my @shift_header_lines_3 = shift_header_lines($dump_stdout_3, $locator);
++my @shift_header_lines_all =
++  (@shift_header_lines_1, @shift_header_lines_2, @shift_header_lines_3);
 +
 +ok(@shift_header_lines_1 > 0,
 +	'first update WAL contains chunk-paired shift headers for updated heap pages');
-+ok(has_slot_transition(\@shift_header_lines_1, 0, 1),
-+	'first update rotates heap pages from slot 0 to slot 1');
-+ok(has_slot_transition(\@shift_header_lines_2, 1, 2),
-+	'second update rotates heap pages from slot 1 to slot 2');
-+ok(has_slot_transition(\@shift_header_lines_3, 2, 0),
-+	'third update rotates heap pages from slot 2 back to slot 0');
++ok(has_slot_transition(\@shift_header_lines_all, 0, 1),
++	'workload rotates heap pages from slot 0 to slot 1');
++ok(has_slot_transition(\@shift_header_lines_all, 1, 2),
++	'workload rotates heap pages from slot 1 to slot 2');
++ok(has_slot_transition(\@shift_header_lines_all, 2, 0),
++	'workload rotates heap pages from slot 2 back to slot 0');
 +
 +done_testing();
 diff --git a/src/test/recovery/t/081_umbra_torn_page_remap.pl b/src/test/recovery/t/081_umbra_torn_page_remap.pl
 new file mode 100644
-index 0000000000..b58aed2459
+index 0000000000..e06d968a79
 --- /dev/null
 +++ b/src/test/recovery/t/081_umbra_torn_page_remap.pl
-@@ -0,0 +1,270 @@
+@@ -0,0 +1,275 @@
 +# Copyright (c) 2026, PostgreSQL Global Development Group
 +
 +# Verify that Umbra crash recovery can recover a shifted heap page even when
@@ -15988,14 +17337,19 @@ index 0000000000..b58aed2459
 +use Test::More;
 +
 +my $use_umbra = check_pg_config('^#define USE_UMBRA 1$');
-+my $chunk_pages = 32;
++my ($chunk_pages) =
++  scan_server_header('storage/umbra.h',
++	q{#define UMBRA_CHUNK_PAIRED_PAGES ([0-9]+)U});
++my ($active_slots) =
++  scan_server_header('storage/umbra.h',
++	q{#define UMBRA_CHUNK_ACTIVE_SLOTS ([0-9]+)U});
 +
 +sub chunk_paired_pblk
 +{
 +	my ($lblk, $target_slot) = @_;
 +	my $chunk_id = int($lblk / $chunk_pages);
 +	my $offset = $lblk % $chunk_pages;
-+	my $pblk = $chunk_id * (3 * $chunk_pages) + $offset;
++	my $pblk = $chunk_id * ($active_slots * $chunk_pages) + $offset;
 +
 +	$pblk += $target_slot * $chunk_pages;
 +	return $pblk;
@@ -16237,10 +17591,10 @@ index 0000000000..b58aed2459
 +done_testing();
 diff --git a/src/test/recovery/t/082_umbra_chunk_paired_smoke.pl b/src/test/recovery/t/082_umbra_chunk_paired_smoke.pl
 new file mode 100644
-index 0000000000..5fbf6de07e
+index 0000000000..c528f311f4
 --- /dev/null
 +++ b/src/test/recovery/t/082_umbra_chunk_paired_smoke.pl
-@@ -0,0 +1,156 @@
+@@ -0,0 +1,167 @@
 +# Copyright (c) 2026, PostgreSQL Global Development Group
 +
 +# Verify the chunk-paired Umbra layout on the first correctness path:
@@ -16256,14 +17610,25 @@ index 0000000000..5fbf6de07e
 +plan skip_all => 'requires --with-umbra MAP fork'
 +	unless check_pg_config('^#define USE_UMBRA 1$');
 +
-+my $chunk_pages = 32;
-+my @boundary_blocks = (0, 31, 32, 63, 64);
++my ($chunk_pages) =
++  scan_server_header('storage/umbra.h',
++	q{#define UMBRA_CHUNK_PAIRED_PAGES ([0-9]+)U});
++my ($active_slots) =
++  scan_server_header('storage/umbra.h',
++	q{#define UMBRA_CHUNK_ACTIVE_SLOTS ([0-9]+)U});
++my @boundary_blocks = (
++	0,
++	$chunk_pages - 1,
++	$chunk_pages,
++	(2 * $chunk_pages) - 1,
++	2 * $chunk_pages);
 +
 +sub chunk_capacity_for_lblk
 +{
 +	my ($lblk) = @_;
 +
-+	return (int($lblk / $chunk_pages) + 1) * (3 * $chunk_pages);
++	return (int($lblk / $chunk_pages) + 1) *
++	  ($active_slots * $chunk_pages);
 +}
 +
 +sub u32le_from_hex
@@ -16393,6 +17758,159 @@ index 0000000000..5fbf6de07e
 +	"SELECT COALESCE(encode(pg_read_binary_file('$drop_map_path', 0, 1, true), 'hex'), '') = '';",
 +	't'),
 +	'dropped relation MAP fork disappears after checkpoint');
++
++$node->stop();
++
++done_testing();
+diff --git a/src/test/recovery/t/083_umbra_chunk_checkpoint_publication.pl b/src/test/recovery/t/083_umbra_chunk_checkpoint_publication.pl
+new file mode 100644
+index 0000000000..0cc6d0d7c9
+--- /dev/null
++++ b/src/test/recovery/t/083_umbra_chunk_checkpoint_publication.pl
+@@ -0,0 +1,147 @@
++# Copyright (c) 2026, PostgreSQL Global Development Group
++
++# Verify the Exp2 C3 checkpoint-crossing schedule for chunk-paired Umbra:
++# pause after block-shift WAL insertion and before MAP publication, prove a
++# concurrent CHECKPOINT waits on the checkpoint-start barrier, then release and
++# verify crash recovery starts from the completed checkpoint with correct data.
++use strict;
++use warnings FATAL => 'all';
++
++use PostgreSQL::Test::Cluster;
++use PostgreSQL::Test::Utils;
++use Test::More;
++
++plan skip_all => 'requires --with-umbra MAP fork'
++	unless check_pg_config('^#define USE_UMBRA 1$');
++
++sub relation_signature_sql
++{
++	return q[
++SELECT count(*) || '|' ||
++       sum(id)::bigint || '|' ||
++       md5(string_agg(id::text || ':' || payload, ',' ORDER BY id))
++FROM umb_c3_t;
++];
++}
++
++sub wait_for_marker_file
++{
++	my ($path, $timeout_secs) = @_;
++
++	for (my $i = 0; $i < $timeout_secs * 100; $i++)
++	{
++		return 1 if -e $path;
++		select(undef, undef, undef, 0.01);
++	}
++
++	return 0;
++}
++
++my $node = PostgreSQL::Test::Cluster->new('umbra_chunk_checkpoint_publication');
++my $psql_timeout = IPC::Run::timer($PostgreSQL::Test::Utils::timeout_default);
++
++$node->init(no_data_checksums => 1);
++$node->append_conf(
++	'postgresql.conf', qq[
++wal_level = 'replica'
++autovacuum = off
++full_page_writes = on
++wal_log_hints = off
++shared_buffers = '256MB'
++max_wal_size = '4GB'
++min_wal_size = '1GB'
++checkpoint_timeout = '1h'
++log_checkpoints = on
++]);
++$node->start();
++
++$node->safe_psql('postgres', q[
++CREATE TABLE umb_c3_t(id int, payload text) WITH (fillfactor = 70);
++ALTER TABLE umb_c3_t ALTER COLUMN payload SET STORAGE PLAIN;
++INSERT INTO umb_c3_t
++SELECT g, repeat('x', 7000)
++FROM generate_series(1, 180) AS g;
++CHECKPOINT;
++]);
++
++my $pause_marker = $node->data_dir . '/umbra_exp2_c3_pause_entered';
++my $release_marker = $node->data_dir . '/umbra_exp2_c3_release';
++unlink $pause_marker;
++unlink $release_marker;
++
++my $update = $node->background_psql('postgres');
++$update->{stdin} .= q[
++SET umbra_exp2_c3_pause = on;
++UPDATE umb_c3_t
++SET payload = md5(id::text) || repeat('u', 6968)
++WHERE split_part(trim(both '()' from ctid::text), ',', 1)::int
++      IN (0, 31, 32, 63, 64);
++\echo update_done
++];
++$update->{run}->pump_nb();
++
++ok(wait_for_marker_file($pause_marker, 30),
++	'update paused after block-shift WAL insert and before MAP publication');
++
++my $checkpoint = $node->background_psql('postgres');
++$checkpoint->{stdin} .= "CHECKPOINT;\n\\echo checkpoint_done\n";
++$checkpoint->{run}->pump_nb();
++
++ok($node->poll_query_until(
++		'postgres',
++		q[
++SELECT EXISTS (
++  SELECT 1
++  FROM pg_stat_activity
++  WHERE backend_type = 'checkpointer'
++    AND wait_event = 'CheckpointDelayStart'
++);
++],
++		't'),
++	'CHECKPOINT waits on the checkpoint-start barrier');
++
++$checkpoint->{run}->pump_nb();
++unlike($checkpoint->{stdout}, qr/checkpoint_done/,
++	'CHECKPOINT does not complete while MAP publication is paused');
++
++open(my $release_fh, '>', $release_marker)
++  or die "could not create $release_marker: $!";
++close($release_fh) or die "could not close $release_marker: $!";
++
++ok(pump_until(
++		$update->{run},
++		$psql_timeout,
++		\$update->{stdout},
++		qr/update_done/),
++	'update finishes after releasing C3 pause');
++
++my $signature_after_update =
++  $node->safe_psql('postgres', relation_signature_sql());
++
++ok(pump_until(
++		$checkpoint->{run},
++		$psql_timeout,
++		\$checkpoint->{stdout},
++		qr/checkpoint_done/),
++	'CHECKPOINT completes after MAP publication');
++
++$update->quit;
++$checkpoint->quit;
++
++$node->stop('immediate');
++$node->start();
++
++is($node->safe_psql('postgres', relation_signature_sql()),
++	$signature_after_update,
++	'checkpoint-visible MAP publication preserves relation contents after crash restart');
++
++is($node->safe_psql(
++		'postgres',
++		q[SELECT count(*) FROM umb_c3_t
++		   WHERE left(payload, 8) = left(md5(id::text), 8);]),
++	'5',
++	'updated rows are visible after checkpoint-crossing crash recovery');
 +
 +$node->stop();
 +

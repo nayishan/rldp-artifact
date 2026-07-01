@@ -12,11 +12,17 @@ TPC-C behavior, capacity cost, and locality cost.
 The artifact is under preparation. Final commands, expected outputs, and
 environment requirements will be added before the full-paper deadline.
 
+## Build
+
+Build the patched PostgreSQL prototype before running experiments. The baseline
+commit, patch application command, and build commands are documented in
+`docs/BUILD.md`.
+
 ## Expected Layout
 
 - `patches/` contains the prototype patch or links to exact implementation
   commits.
 - `scripts/` contains experiment runners grouped by experiment.
 - `configs/` records PostgreSQL, benchmark, and machine configuration.
-- `results/` stores raw logs and processed summaries.
+- `results/` stores experiment summaries used by the paper.
 - `analysis/` stores parsers and summarization scripts.

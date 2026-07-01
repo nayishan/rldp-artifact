@@ -1,0 +1,66 @@
+[jiamingwei@node-126 ~]$ cat hardware_disk_report.txt
+Report file : hardware_disk_report.txt
+
+
+========== Report ==========
+Generated at : 2026-06-28T15:07:16+0800
+Kernel       : Linux 3.10.0-957.el7.x86_64 x86_64 GNU/Linux
+OS           : CentOS Linux 7 (Core)
+
+========== CPU Summary ==========
+  Model        : Intel(R) Xeon(R) Gold 6342 CPU @ 2.80GHz
+  Vendor       : GenuineIntel
+  Architecture : x86_64
+  CPUs         : 96
+  Sockets      : 2
+  Cores/socket : 24
+  Threads/core : 2
+  Max MHz      : 3500.0000
+
+========== Memory Summary ==========
+Memory : total=503G used=7.9G available=492G
+Swap   : total=4.0G used=782M free=3.2G
+Slot             Size        Speed        Manufacturer        Part
+CPU1_CH1_D0(A0)  32 GB       3200 MT/s    Samsung             M393A4K40DB3-CWE
+CPU1_CH2_D0(B0)  32 GB       3200 MT/s    Samsung             M393A4K40DB3-CWE
+CPU1_CH3_D0(C0)  32 GB       3200 MT/s    Samsung             M393A4K40DB3-CWE
+CPU1_CH4_D0(D0)  32 GB       3200 MT/s    Samsung             M393A4K40DB3-CWE
+CPU1_CH5_D0(E0)  32 GB       3200 MT/s    Samsung             M393A4K40DB3-CWE
+CPU1_CH6_D0(F0)  32 GB       3200 MT/s    Samsung             M393A4K40DB3-CWE
+CPU1_CH7_D0(G0)  32 GB       3200 MT/s    Samsung             M393A4K40DB3-CWE
+CPU1_CH8_D0(H0)  32 GB       3200 MT/s    Samsung             M393A4K40DB3-CWE
+CPU2_CH1_D0(A0)  32 GB       3200 MT/s    Samsung             M393A4K40DB3-CWE
+CPU2_CH2_D0(B0)  32 GB       3200 MT/s    Samsung             M393A4K40DB3-CWE
+CPU2_CH3_D0(C0)  32 GB       3200 MT/s    Samsung             M393A4K40DB3-CWE
+CPU2_CH4_D0(D0)  32 GB       3200 MT/s    Samsung             M393A4K40DB3-CWE
+CPU2_CH5_D0(E0)  32 GB       3200 MT/s    Samsung             M393A4K40DB3-CWE
+CPU2_CH6_D0(F0)  32 GB       3200 MT/s    Samsung             M393A4K40DB3-CWE
+CPU2_CH7_D0(G0)  32 GB       3200 MT/s    Samsung             M393A4K40DB3-CWE
+CPU2_CH8_D0(H0)  32 GB       3200 MT/s    Samsung             M393A4K40DB3-CWE
+
+========== Experiment Storage ==========
+Benchmark path: <redacted>
+Mount point : /home
+Source      : /dev/mapper/centos-home
+Filesystem  : xfs
+
+Filesystem capacity:
+Filesystem              Type  Size  Used  Avail  Use%  Mounted on
+/dev/mapper/centos-home xfs   1.7T  849G  885G   49%   /home
+
+Block-device chain for benchmark filesystem:
+NAME          TYPE  SIZE  TRAN  MODEL                         MOUNTPOINT
+centos-home   lvm   1.7T                                      /home
+└─nvme0n1p3   part  1.8T
+  └─nvme0n1   disk  1.8T        SAMSUNG MZQL21T9HCJR-00B7C
+
+========== Disk Benchmark ==========
+Tool: fio, size=16G, runtime=300s
+Sequential write
+  WRITE: io=539578MB, aggrb=1798.7MB/s, minb=1798.7MB/s, maxb=1798.7MB/s, mint=300001msec, maxt=300001msec
+Sequential read
+  READ: io=1011.6GB, aggrb=3452.7MB/s, minb=3452.7MB/s, maxb=3452.7MB/s, mint=300001msec, maxt=300001msec
+Random read/write 70/30, 4K
+  READ: io=63340MB, aggrb=216199KB/s, minb=216199KB/s, maxb=216199KB/s, mint=300001msec, maxt=300001msec
+  WRITE: io=27151MB, aggrb=92676KB/s, minb=92676KB/s, maxb=92676KB/s, mint=300001msec, maxt=300001msec
+[jiamingwei@node-126 ~]$
